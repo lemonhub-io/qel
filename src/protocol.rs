@@ -649,10 +649,18 @@ pub fn store_received_pack(
     let resolve = |oid: &Oid| repo.odb.read_opt(oid).ok().flatten();
     let objects = resolve_pack(pack_bytes, &resolve)?;
     if !quiet {
-        eprintln!("resolved {} objects", objects.len());
+        eprintln!("resolved {} objects", objects.objects.len());
+    }
+    if !objects.thin && !objects.objects.is_empty() {
+        // self-contained pack: keep it verbatim (preserves the sender's
+        // delta compression and avoids a full re-deflate pass)
+        let oids: Vec<Oid> = objects.objects.iter().map(|o| o.0).collect();
+        let dir = repo.odb.primary_dir().join("pack");
+        crate::pack::store_pack_bytes(&dir, pack_bytes, &oids, &objects.offsets)?;
+        return Ok(objects.objects.len());
     }
     let mut pack_objs = Vec::new();
-    for (oid, ty, data) in &objects {
+    for (oid, ty, data) in &objects.objects {
         if !repo.odb.has(oid) {
             pack_objs.push(PackObj {
                 oid: *oid,
@@ -885,7 +893,7 @@ pub fn build_pack_for_push(
     // The protocol requires a pack whenever any update has a non-zero
     // new value — even when it contains zero objects. An empty vec here
     // would deadlock a server waiting to parse PACK data.
-    Ok(crate::pack::write_pack(&ordered))
+    Ok(crate::pack::write_pack_delta(&ordered).0)
 }
 
 // ============================== protocol v2 ==============================
@@ -1369,7 +1377,7 @@ fn build_pack_shallow(repo: &Repo, wants: &[Oid], remote_tips: &[Oid], depth: u3
     if ordered.is_empty() {
         return Ok(Vec::new());
     }
-    Ok(crate::pack::write_pack(&ordered))
+    Ok(crate::pack::write_pack_delta(&ordered).0)
 }
 
 fn serve_v2_fetch(repo: &Repo, args: &[String], w: &mut dyn Write) -> Result<()> {
@@ -1724,8 +1732,9 @@ pub fn read_pack_stream(r: &mut dyn Read) -> Result<Vec<u8>> {
 
 /// Send `data` as side-band-64k band-1 packets (plus trailing flush).
 fn write_band1(w: &mut dyn Write, data: &[u8]) -> Result<()> {
-    const MAX: usize = 65520; // payload incl. band byte must fit 0xffff-4
-    for chunk in data.chunks(MAX - 1) {
+    // LARGE_PACKET_DATA_MAX = 65520 - 4 = 65516 bytes including the band byte.
+    const MAX: usize = 65515;
+    for chunk in data.chunks(MAX) {
         let mut pkt = Vec::with_capacity(chunk.len() + 1);
         pkt.push(1u8);
         pkt.extend_from_slice(chunk);

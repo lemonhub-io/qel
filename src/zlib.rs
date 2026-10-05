@@ -7,58 +7,93 @@ use crate::util::{adler32, GitError, Result};
 
 // ============================== INFLATE ==============================
 
+/// Bit-level reader with a 64-bit bit buffer; bits arrive LSB-first.
 struct BitReader<'a> {
     data: &'a [u8],
-    pos: usize,   // byte position
-    bit: u32,     // bits consumed in current byte (0..8)
+    pos: usize,   // next byte to load into bitbuf
+    bitbuf: u64,
+    bitcnt: u32,  // valid bits in bitbuf
 }
 
 impl<'a> BitReader<'a> {
     fn new(data: &'a [u8]) -> Self {
-        BitReader { data, pos: 0, bit: 0 }
+        BitReader {
+            data,
+            pos: 0,
+            bitbuf: 0,
+            bitcnt: 0,
+        }
     }
 
-    fn read_bit(&mut self) -> Result<u32> {
-        if self.pos >= self.data.len() {
+    #[inline(always)]
+    fn fill(&mut self) {
+        if self.bitcnt >= 56 {
+            return;
+        }
+        // fast path: 8 bytes available
+        if self.pos + 8 <= self.data.len() {
+            let chunk = u64::from_le_bytes(self.data[self.pos..self.pos + 8].try_into().unwrap());
+            self.bitbuf |= chunk << self.bitcnt;
+            self.pos += (63 - self.bitcnt) as usize >> 3;
+            self.bitcnt |= 56;
+            return;
+        }
+        while self.bitcnt <= 56 && self.pos < self.data.len() {
+            self.bitbuf |= (self.data[self.pos] as u64) << self.bitcnt;
+            self.pos += 1;
+            self.bitcnt += 8;
+        }
+    }
+
+    /// Peek at up to n bits without consuming (n <= 56). Bits past EOF read 0.
+    #[inline(always)]
+    fn peek(&mut self) -> u64 {
+        self.fill();
+        self.bitbuf
+    }
+
+    #[inline(always)]
+    fn drop_bits(&mut self, n: u32) {
+        self.bitbuf >>= n;
+        self.bitcnt -= n;
+    }
+
+    #[inline(always)]
+    fn read_bits(&mut self, n: u32) -> Result<u32> {
+        self.fill();
+        if self.bitcnt < n {
             return Err(GitError::Parse("deflate: unexpected end of input".into()));
         }
-        let b = (self.data[self.pos] >> self.bit) & 1;
-        self.bit += 1;
-        if self.bit == 8 {
-            self.bit = 0;
-            self.pos += 1;
-        }
-        Ok(b as u32)
-    }
-
-    /// n bits, LSB-first
-    fn read_bits(&mut self, n: u32) -> Result<u32> {
-        let mut v = 0u32;
-        for i in 0..n {
-            v |= self.read_bit()? << i;
-        }
+        let v = (self.bitbuf & ((1u64 << n) - 1)) as u32;
+        self.bitbuf >>= n;
+        self.bitcnt -= n;
         Ok(v)
     }
 
     fn align_byte(&mut self) {
-        if self.bit != 0 {
-            self.bit = 0;
-            self.pos += 1;
-        }
+        let r = self.bitcnt % 8;
+        self.bitbuf >>= r;
+        self.bitcnt -= r;
     }
 
     /// bytes consumed so far (rounds up a partial byte)
     fn consumed(&self) -> usize {
-        self.pos + if self.bit > 0 { 1 } else { 0 }
+        self.pos - (self.bitcnt as usize / 8)
     }
 }
 
-/// Canonical Huffman decoder using the puff() scheme:
-/// counts[len] = number of symbols with that code length,
-/// symbols[] sorted by code length then by symbol value order.
+/// Canonical Huffman decoder: canonical counts+symbols for the slow path,
+/// plus a single-level lookup table over the first FAST_BITS stream bits.
+const FAST_BITS: usize = 9;
+const FAST_SIZE: usize = 1 << FAST_BITS;
+
 struct Huffman {
     counts: [u16; 16],
     symbols: Vec<u16>,
+    /// fast[i] = (symbol+1) << 5 | codelen when the low `len` bits of i are
+    /// the bit-reversed code; 0 means "not a short code" (long/invalid —
+    /// fall back to the canonical walk).
+    fast: Vec<u32>,
 }
 
 impl Huffman {
@@ -91,25 +126,83 @@ impl Huffman {
                 offs[l as usize] += 1;
             }
         }
-        Ok(Huffman { counts, symbols })
+        // canonical first-code values per length
+        let mut next = [0u32; 16];
+        let mut code = 0u32;
+        for l in 1..16 {
+            code = (code + counts[l - 1] as u32) << 1;
+            next[l] = code;
+        }
+        let mut fast = vec![0u32; FAST_SIZE];
+        let mut rank = [0u32; 16];
+        for (sym, &l) in lengths.iter().enumerate() {
+            if l == 0 {
+                continue;
+            }
+            let l = l as usize;
+            let code = next[l] + rank[l];
+            rank[l] += 1;
+            if l <= FAST_BITS {
+                // stream bits arrive LSB-first but code is emitted MSB-first:
+                // table index = bit-reversed code in the low l bits
+                let rev = reverse_bits(code, l);
+                let entry = ((sym as u32 + 1) << 5) | l as u32;
+                let mut idx = rev as usize;
+                while idx < FAST_SIZE {
+                    fast[idx] = entry;
+                    idx += 1 << l;
+                }
+            }
+        }
+        Ok(Huffman {
+            counts,
+            symbols,
+            fast,
+        })
     }
 
+    #[inline(always)]
     fn decode(&self, br: &mut BitReader) -> Result<u16> {
+        let bits = br.peek();
+        let e = self.fast[(bits & (FAST_SIZE as u64 - 1)) as usize];
+        if e != 0 {
+            let len = e & 31;
+            if len as u32 <= br.bitcnt {
+                br.drop_bits(len as u32);
+                return Ok(((e >> 5) - 1) as u16);
+            }
+            return Err(GitError::Parse("deflate: truncated huffman code".into()));
+        }
+        // long or invalid code: canonical walk, one bit at a time
         let mut code: i32 = 0;
         let mut first: i32 = 0;
         let mut index: usize = 0;
         for len in 1..16 {
-            code |= br.read_bit()? as i32;
+            br.fill();
+            if br.bitcnt == 0 {
+                return Err(GitError::Parse("deflate: unexpected end of input".into()));
+            }
+            code = (code << 1) | (br.bitbuf & 1) as i32;
+            br.bitbuf >>= 1;
+            br.bitcnt -= 1;
             let count = self.counts[len] as i32;
             if code - first < count {
                 return Ok(self.symbols[index + (code - first) as usize]);
             }
             index += count as usize;
             first = (first + count) << 1;
-            code <<= 1;
         }
         Err(GitError::Parse("deflate: invalid huffman code".into()))
     }
+}
+
+#[inline]
+fn reverse_bits(v: u32, n: usize) -> u32 {
+    let mut r = 0u32;
+    for i in 0..n {
+        r |= ((v >> i) & 1) << (n - 1 - i);
+    }
+    r
 }
 
 const LENGTH_BASE: [u16; 29] = [
@@ -146,25 +239,30 @@ pub fn inflate_raw(data: &[u8], size_hint: usize) -> Result<(Vec<u8>, usize)> {
     let mut br = BitReader::new(data);
     let mut out: Vec<u8> = Vec::with_capacity(size_hint.max(64));
     loop {
-        let bfinal = br.read_bit()?;
+        let bfinal = br.read_bits(1)?;
         let btype = br.read_bits(2)?;
         match btype {
             0 => {
                 br.align_byte();
-                if br.pos + 4 > data.len() {
+                // bitbuf may hold buffered bytes; the stored block begins at
+                // the first unconsumed byte
+                let p = br.pos - br.bitcnt as usize / 8;
+                if p + 4 > data.len() {
                     return Err(GitError::Parse("deflate: truncated stored block".into()));
                 }
-                let len = u16::from_le_bytes([data[br.pos], data[br.pos + 1]]) as usize;
-                let nlen = u16::from_le_bytes([data[br.pos + 2], data[br.pos + 3]]) as usize;
+                let len = u16::from_le_bytes([data[p], data[p + 1]]) as usize;
+                let nlen = u16::from_le_bytes([data[p + 2], data[p + 3]]) as usize;
                 if len != (!nlen & 0xFFFF) {
                     return Err(GitError::Parse("deflate: bad stored LEN/NLEN".into()));
                 }
-                br.pos += 4;
-                if br.pos + len > data.len() {
+                if p + 4 + len > data.len() {
                     return Err(GitError::Parse("deflate: truncated stored data".into()));
                 }
-                out.extend_from_slice(&data[br.pos..br.pos + len]);
-                br.pos += len;
+                out.extend_from_slice(&data[p + 4..p + 4 + len]);
+                // restart buffering after the stored bytes
+                br.pos = p + 4 + len;
+                br.bitbuf = 0;
+                br.bitcnt = 0;
             }
             1 => {
                 let lit = Huffman::new(&fixed_lit_lengths())?;
@@ -262,9 +360,14 @@ fn inflate_block(
                     return Err(GitError::Parse("deflate: distance too far back".into()));
                 }
                 let start = out.len() - d;
-                for k in 0..len {
-                    let b = out[start + k];
-                    out.push(b);
+                if d >= len {
+                    out.extend_from_within(start..start + len);
+                } else {
+                    out.reserve(len);
+                    for k in 0..len {
+                        let b = out[start + k];
+                        out.push(b);
+                    }
                 }
             }
             _ => return Err(GitError::Parse("deflate: invalid length symbol".into())),
@@ -303,44 +406,54 @@ pub fn inflate(data: &[u8], size_hint: usize) -> Result<(Vec<u8>, usize)> {
 
 // ============================== DEFLATE ==============================
 
+/// Bit-level writer with a 64-bit bit buffer; bits flushed LSB-first.
 struct BitWriter {
     out: Vec<u8>,
-    cur: u8,
-    nbits: u32,
+    bitbuf: u64,
+    bitcnt: u32,
 }
 
 impl BitWriter {
     fn new() -> Self {
-        BitWriter { out: Vec::new(), cur: 0, nbits: 0 }
+        BitWriter {
+            out: Vec::new(),
+            bitbuf: 0,
+            bitcnt: 0,
+        }
     }
 
-    fn write_bit(&mut self, b: u32) {
-        self.cur |= ((b & 1) as u8) << self.nbits;
-        self.nbits += 1;
-        if self.nbits == 8 {
-            self.out.push(self.cur);
-            self.cur = 0;
-            self.nbits = 0;
+    #[inline(always)]
+    fn flush_bytes(&mut self) {
+        while self.bitcnt >= 8 {
+            self.out.push(self.bitbuf as u8);
+            self.bitbuf >>= 8;
+            self.bitcnt -= 8;
         }
     }
 
     /// plain value, LSB-first
+    #[inline(always)]
     fn write_bits(&mut self, v: u32, n: u32) {
-        for i in 0..n {
-            self.write_bit(v >> i);
+        if n == 0 {
+            return;
         }
+        self.bitbuf |= (v as u64 & ((1u64 << n) - 1)) << self.bitcnt;
+        self.bitcnt += n;
+        self.flush_bytes();
     }
 
     /// huffman code: MSB of the code is emitted first
+    #[inline(always)]
     fn write_code(&mut self, code: u32, len: u32) {
-        for i in (0..len).rev() {
-            self.write_bit(code >> i);
-        }
+        let rev = (code as u64).reverse_bits() >> (64 - len);
+        self.bitbuf |= rev << self.bitcnt;
+        self.bitcnt += len;
+        self.flush_bytes();
     }
 
     fn finish(mut self) -> Vec<u8> {
-        if self.nbits > 0 {
-            self.out.push(self.cur);
+        if self.bitcnt > 0 {
+            self.out.push(self.bitbuf as u8);
         }
         self.out
     }
@@ -387,7 +500,9 @@ fn dist_symbol(dist: usize) -> (usize, u32, u32) {
 const HASH_BITS: usize = 15;
 const HASH_SIZE: usize = 1 << HASH_BITS;
 const WINDOW: usize = 32768;
-const MAX_CHAIN: usize = 256;
+const MAX_CHAIN: usize = 64;
+const GOOD_MATCH: usize = 32;
+const NICE_MATCH: usize = 128;
 const MIN_MATCH: usize = 3;
 const MAX_MATCH: usize = 258;
 
@@ -396,68 +511,73 @@ fn hash3(data: &[u8], i: usize) -> usize {
     (v.wrapping_mul(0x9E3779B1) >> (32 - HASH_BITS)) as usize
 }
 
-/// LZ77-parse `data` and emit one fixed-Huffman block into `bw`.
-/// Calls `emit(bw, LitOrMatch)` internally.
-struct Emitter<'a> {
-    bw: &'a mut BitWriter,
+thread_local! {
+    /// Hash-chain tables reused across deflate calls in a thread. Entries are
+    /// absolute positions in the *current* input; stale entries from previous
+    /// buffers are detected by the window/bounds guards in the matcher.
+    static DEF_HEAD: std::cell::RefCell<Vec<i32>> = const { std::cell::RefCell::new(Vec::new()) };
+    static DEF_PREV: std::cell::RefCell<Vec<i32>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-impl<'a> Emitter<'a> {
-    fn literal(&mut self, b: u8) {
-        let (c, l) = fixed_lit_code(b as usize);
-        self.bw.write_code(c, l);
-    }
-    fn backref(&mut self, len: usize, dist: usize) {
-        let (sym, ebits, eval) = length_symbol(len);
-        let (c, l) = fixed_lit_code(sym);
-        self.bw.write_code(c, l);
-        self.bw.write_bits(eval, ebits);
-        let (dsym, dbits, dval) = dist_symbol(dist);
-        self.bw.write_code(dsym as u32, 5);
-        self.bw.write_bits(dval, dbits);
-    }
-}
-
-/// Compress with a single fixed-Huffman block (BFINAL=1, BTYPE=01).
-/// For very large inputs we split into multiple fixed blocks to keep
-/// hash tables small in memory (chains reset per block is unnecessary —
-/// we just run the matcher over the whole input and emit one block;
-/// deflate allows matches across any distance within the window).
+/// Compress with fixed-Huffman blocks. Inputs are chunked at 8MB per block.
 pub fn deflate_raw(data: &[u8]) -> Vec<u8> {
     let mut bw = BitWriter::new();
-    // For inputs > ~16MB, emitting multiple blocks keeps memory sane.
     const BLOCK_CHUNK: usize = 8 << 20;
     let nblocks = data.len().div_ceil(BLOCK_CHUNK).max(1);
-    for blk in 0..nblocks {
-        let start = blk * BLOCK_CHUNK;
-        let end = ((blk + 1) * BLOCK_CHUNK).min(data.len());
-        let last = blk == nblocks - 1;
-        bw.write_bit(last as u32);
-        bw.write_bits(1, 2); // fixed huffman
-        deflate_block(&mut bw, &data[..end], start);
-    }
+    DEF_HEAD.with(|h| {
+        DEF_PREV.with(|p| {
+            let mut head = h.borrow_mut();
+            let mut prev = p.borrow_mut();
+            head.clear();
+            head.resize(HASH_SIZE, -1);
+            prev.clear();
+            prev.resize(WINDOW, -1);
+            for blk in 0..nblocks {
+                let start = blk * BLOCK_CHUNK;
+                let end = ((blk + 1) * BLOCK_CHUNK).min(data.len());
+                let last = blk == nblocks - 1;
+                bw.write_bits(last as u32, 1);
+                bw.write_bits(1, 2); // fixed huffman
+                deflate_block(&mut bw, data, start, end, &mut head, &mut prev);
+            }
+        })
+    });
     bw.finish()
 }
 
-/// Emit matches/literals for data[start..end]; `data` is the full buffer so
-/// matches may reference earlier content within the 32K window.
-fn deflate_block(bw: &mut BitWriter, data: &[u8], start: usize) {
-    let mut head = vec![-1i64; HASH_SIZE];
-    let mut prev = vec![-1i64; data.len().min(start + WINDOW + MAX_MATCH + 64)];
-    let mut em = Emitter { bw };
+/// Emit matches/literals for data[start..end]; hash chains are indexed by
+/// absolute position and bounded by the 32K window.
+fn deflate_block(
+    bw: &mut BitWriter,
+    data: &[u8],
+    start: usize,
+    end: usize,
+    head: &mut [i32],
+    prev: &mut [i32],
+) {
+    let n = end;
     let mut i = start;
-    let n = data.len();
     while i < n {
         let mut best_len = 0usize;
         let mut best_dist = 0usize;
         if i + MIN_MATCH < n {
             let h = hash3(data, i);
             let mut cand = head[h];
-            let mut chain = 0;
+            let mut chain = 0u32;
             let limit = i.saturating_sub(WINDOW);
-            while cand >= 0 && chain < MAX_CHAIN {
+            while cand >= 0 {
+                let max_chain = if best_len >= GOOD_MATCH {
+                    MAX_CHAIN / 4
+                } else {
+                    MAX_CHAIN
+                };
+                if chain >= max_chain as u32 {
+                    break;
+                }
                 let c = cand as usize;
-                if c < limit {
+                // stale entries (previous buffers / overwritten slots) show up
+                // as out-of-window or forward positions — end the chain there
+                if c < limit || c >= i {
                     break;
                 }
                 // quick check: compare byte at current best_len
@@ -467,46 +587,65 @@ fn deflate_block(bw: &mut BitWriter, data: &[u8], start: usize) {
                         && data[c + best_len] == data[i + best_len])
                 {
                     let mut l = 0usize;
-                    while i + l < n && l < MAX_MATCH && data[c + l] == data[i + l] {
+                    let maxl = (n - i).min(MAX_MATCH);
+                    while l + 8 <= maxl
+                        && u64::from_le_bytes(data[c + l..c + l + 8].try_into().unwrap())
+                            == u64::from_le_bytes(data[i + l..i + l + 8].try_into().unwrap())
+                    {
+                        l += 8;
+                    }
+                    while l < maxl && data[c + l] == data[i + l] {
                         l += 1;
                     }
                     if l > best_len {
                         best_len = l;
                         best_dist = i - c;
-                        if l >= MAX_MATCH {
+                        if l >= NICE_MATCH {
                             break;
                         }
                     }
                 }
-                cand = prev[c % prev.len()];
+                cand = prev[c & (WINDOW - 1)];
                 chain += 1;
             }
             // insert current position into chain
-            let plen = prev.len();
-            prev[i % plen] = head[h];
-            head[h] = i as i64;
+            prev[i & (WINDOW - 1)] = head[h];
+            head[h] = i as i32;
         }
         if best_len >= MIN_MATCH && (best_len > 3 || best_dist <= 4096) {
-            em.backref(best_len, best_dist);
-            // add skipped positions to the hash chains (sampled for speed)
+            emit_backref(bw, best_len, best_dist);
+            // add skipped positions to the hash chains; for long matches
+            // only sample — keeps the table hot without per-byte cost
             let next = i + best_len;
+            let step = if best_len >= GOOD_MATCH { 4 } else { 1 };
             let mut j = i + 1;
             while j < next && j + MIN_MATCH < n {
                 let h = hash3(data, j);
-                let plen = prev.len();
-                prev[j % plen] = head[h];
-                head[h] = j as i64;
-                j += 1;
+                prev[j & (WINDOW - 1)] = head[h];
+                head[h] = j as i32;
+                j += step;
             }
             i = next;
         } else {
-            em.literal(data[i]);
+            let (c, l) = fixed_lit_code(data[i] as usize);
+            bw.write_code(c, l);
             i += 1;
         }
     }
     // end of block
     let (c, l) = fixed_lit_code(256);
-    em.bw.write_code(c, l);
+    bw.write_code(c, l);
+}
+
+#[inline]
+fn emit_backref(bw: &mut BitWriter, len: usize, dist: usize) {
+    let (sym, ebits, eval) = length_symbol(len);
+    let (c, l) = fixed_lit_code(sym);
+    bw.write_code(c, l);
+    bw.write_bits(eval, ebits);
+    let (dsym, dbits, dval) = dist_symbol(dist);
+    bw.write_code(dsym as u32, 5);
+    bw.write_bits(dval, dbits);
 }
 
 /// Compress `data` into a zlib stream (RFC 1950).

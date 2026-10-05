@@ -888,7 +888,13 @@ fn cmd_log(args: &[String]) -> Result<i32> {
             s if s.starts_with("--max-count=") => {
                 max = s["--max-count=".len()..].parse().ok();
             }
-            "-1" => max = Some(1),
+            s if s.len() > 1
+                && s.starts_with('-')
+                && !s.starts_with("--")
+                && s[1..].chars().all(|c| c.is_ascii_digit()) =>
+            {
+                max = s[1..].parse().ok();
+            }
             s if !s.starts_with('-') && !spec_set => {
                 spec = s.to_string();
                 spec_set = true;
@@ -2856,15 +2862,23 @@ fn cmd_index_pack(args: &[String]) -> Result<i32> {
     };
     let resolve = |oid: &Oid| repo.odb.read_opt(oid).ok().flatten();
     let objects = crate::pack::resolve_pack(&data, &resolve)?;
-    let mut pack_objs = Vec::new();
-    for (oid, ty, d) in &objects {
-        pack_objs.push(crate::pack::PackObj {
-            oid: *oid,
-            ty: *ty,
-            data: d.clone(),
-        });
-    }
-    let name = repo.odb.store_pack(&pack_objs)?;
+    let dir = repo.odb.primary_dir().join("pack");
+    let name = if objects.thin {
+        // thin packs must be completed: rewrite as full objects
+        let pack_objs: Vec<crate::pack::PackObj> = objects
+            .objects
+            .iter()
+            .map(|(oid, ty, d)| crate::pack::PackObj {
+                oid: *oid,
+                ty: *ty,
+                data: d.clone(),
+            })
+            .collect();
+        repo.odb.store_pack(&pack_objs)?
+    } else {
+        let oids: Vec<Oid> = objects.objects.iter().map(|o| o.0).collect();
+        crate::pack::store_pack_bytes(&dir, &data, &oids, &objects.offsets)?
+    };
     println!("{}", name.trim_start_matches("pack-"));
     Ok(0)
 }
@@ -2876,7 +2890,7 @@ fn cmd_unpack_objects(_args: &[String]) -> Result<i32> {
     std::io::stdin().read_to_end(&mut data)?;
     let resolve = |oid: &Oid| repo.odb.read_opt(oid).ok().flatten();
     let objects = crate::pack::resolve_pack(&data, &resolve)?;
-    for (oid, ty, d) in &objects {
+    for (oid, ty, d) in &objects.objects {
         repo.odb.write_with_oid(oid, *ty, d)?;
     }
     Ok(0)
@@ -2918,13 +2932,12 @@ fn cmd_pack_objects(args: &[String]) -> Result<i32> {
             });
         }
     }
-    let pack = crate::pack::write_pack(&objs);
+    let (pack, oids) = crate::pack::write_pack_delta(&objs);
     if out_file == "pack" || out_file == "-" {
         use std::io::Write;
         std::io::stdout().write_all(&pack)?;
     } else {
         std::fs::write(format!("{}.pack", out_file), &pack)?;
-        let oids: Vec<Oid> = objs.iter().map(|o| o.oid).collect();
         let idx = crate::pack::write_idx(&pack, &oids)?;
         std::fs::write(format!("{}.idx", out_file), idx)?;
         let hash = &pack[pack.len() - 20..];
@@ -3440,9 +3453,11 @@ fn cmd_gc(_args: &[String]) -> Result<i32> {
             data: obj.1.clone(),
         });
     }
-    if !pack_objs.is_empty() {
-        repo.odb.store_pack(&pack_objs)?;
-    }
+    let new_pack = if !pack_objs.is_empty() {
+        Some(repo.odb.store_pack(&pack_objs)?)
+    } else {
+        None
+    };
     // prune loose objects now covered by the pack
     let objects_dir = repo.odb.primary_dir();
     let mut pruned = 0usize;
@@ -3475,26 +3490,41 @@ fn cmd_gc(_args: &[String]) -> Result<i32> {
         // drop now-empty fanout dir
         let _ = std::fs::remove_dir(sub.path());
     }
-    // drop old packs other than the fresh one — objects are all in it
+    // drop old packs other than the fresh one — objects are all in it.
+    // Honor *.keep packs (git repack preserves them) and never touch
+    // unrelated files (tmp_pack_*, .keep sidecars live with their pack).
     let pack_dir = objects_dir.join("pack");
-    let mut packs: Vec<_> = std::fs::read_dir(&pack_dir)
-        .into_iter()
-        .flatten()
-        .filter_map(|e| e.ok())
-        .collect();
-    packs.sort_by_key(|e| e.file_name());
-    if packs.len() > 2 {
-        // keep the most recent pack+idx pair
-        for e in &packs[..packs.len() - 2] {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(
-                    e.path(),
-                    std::fs::Permissions::from_mode(0o644),
-                );
+    let mut pack_bases: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut keep: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for e in std::fs::read_dir(&pack_dir).into_iter().flatten().flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if let Some(base) = name.strip_suffix(".keep") {
+            keep.insert(base.to_string());
+        } else if name.starts_with("pack-") {
+            let base = name
+                .strip_suffix(".pack")
+                .or_else(|| name.strip_suffix(".idx"))
+                .or_else(|| name.strip_suffix(".rev"))
+                .map(|s| s.to_string());
+            if let Some(b) = base {
+                pack_bases.insert(b);
             }
-            let _ = std::fs::remove_file(e.path());
+        }
+    }
+    for base in pack_bases {
+        if Some(&base) == new_pack.as_ref() || keep.contains(&base) {
+            continue;
+        }
+        for ext in ["pack", "idx", "rev", "keep", "bitmap", "promisor"] {
+            let p = pack_dir.join(format!("{}.{}", base, ext));
+            if p.exists() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644));
+                }
+                let _ = std::fs::remove_file(&p);
+            }
         }
     }
     refs::pack_refs(&repo)?;

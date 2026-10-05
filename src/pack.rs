@@ -360,13 +360,14 @@ impl Pack {
 // ============================== received pack resolution ==============================
 
 struct PackResolver<'a> {
-    pack: &'a [u8],
     headers: Vec<EntryHeader>,
+    bodies: &'a [Vec<u8>],
     off_to_idx: HashMap<u64, usize>,
     oid_to_idx: HashMap<Oid, usize>,
     resolved: Vec<Option<Rc<(ObjType, Vec<u8>)>>>,
     resolving: Vec<bool>,
     resolve_ref: &'a dyn Fn(&Oid) -> Option<Rc<(ObjType, Vec<u8>)>>,
+    used_external: bool,
 }
 
 impl<'a> PackResolver<'a> {
@@ -378,23 +379,19 @@ impl<'a> PackResolver<'a> {
             return Err(GitError::ObjectCorrupt("circular delta chain".into()));
         }
         self.resolving[i] = true;
-        let (type_id, data_off, size, base_off, base_oid) = {
+        let (type_id, base_off, base_oid) = {
             let h = &self.headers[i];
-            (h.type_id, h.data_offset, h.size, h.base_offset, h.base_oid)
+            (h.type_id, h.base_offset, h.base_oid)
         };
         let r: Rc<(ObjType, Vec<u8>)> = match type_id {
-            1 | 2 | 3 | 4 => {
-                let (body, _) = zlib::inflate(&self.pack[data_off..], size as usize)?;
-                Rc::new((ObjType::from_pack_id(type_id)?, body))
-            }
+            1 | 2 | 3 | 4 => Rc::new((ObjType::from_pack_id(type_id)?, self.bodies[i].clone())),
             OBJ_OFS_DELTA => {
                 let bi = *self
                     .off_to_idx
                     .get(&base_off.unwrap())
                     .ok_or_else(|| GitError::ObjectCorrupt("ofs-delta base missing".into()))?;
                 let base = self.resolve_one(bi)?;
-                let (delta, _) = zlib::inflate(&self.pack[data_off..], size as usize)?;
-                Rc::new((base.0, apply_delta(&base.1, &delta)?))
+                Rc::new((base.0, apply_delta(&base.1, &self.bodies[i])?))
             }
             OBJ_REF_DELTA => {
                 let base_oid = base_oid.unwrap();
@@ -403,6 +400,7 @@ impl<'a> PackResolver<'a> {
                 let base = if let Some(bi) = bi {
                     self.resolve_one(bi)?
                 } else if let Some(ext) = (self.resolve_ref)(&base_oid) {
+                    self.used_external = true;
                     ext
                 } else {
                     // base must be an unresolved pack entry: resolve all
@@ -427,8 +425,7 @@ impl<'a> PackResolver<'a> {
                         }
                     }
                 };
-                let (delta, _) = zlib::inflate(&self.pack[data_off..], size as usize)?;
-                Rc::new((base.0, apply_delta(&base.1, &delta)?))
+                Rc::new((base.0, apply_delta(&base.1, &self.bodies[i])?))
             }
             t => return Err(GitError::Parse(format!("pack: bad type {}", t))),
         };
@@ -440,25 +437,40 @@ impl<'a> PackResolver<'a> {
     }
 }
 
+/// Result of fully resolving a pack.
+pub struct ResolvedPack {
+    /// (oid, type, full content) in pack order
+    pub objects: Vec<(Oid, ObjType, Vec<u8>)>,
+    /// entry offsets in pack order (for idx writing)
+    pub offsets: Vec<u64>,
+    /// true if any ref-delta base came from outside the pack (thin pack)
+    pub thin: bool,
+}
+
 /// Fully resolve a received pack (possibly thin) into a flat object list.
 /// `resolve_ref` must return objects already in our odb for ref-deltas
 /// whose base is not inside the pack.
 pub fn resolve_pack(
     pack_bytes: &[u8],
     resolve_ref: &dyn Fn(&Oid) -> Option<Rc<(ObjType, Vec<u8>)>>,
-) -> Result<Vec<(Oid, ObjType, Vec<u8>)>> {
+) -> Result<ResolvedPack> {
     if pack_bytes.len() < 12 || &pack_bytes[0..4] != b"PACK" {
         return Err(GitError::Parse("bad pack header".into()));
     }
     let count = be_u32(&pack_bytes[8..12]) as usize;
-    // first pass: find entry offsets & headers
+    // single pass: inflate each entry once to discover its compressed length
+    // and cache the raw entry body (object or delta) for resolution
     let mut headers = Vec::with_capacity(count);
+    let mut bodies = Vec::with_capacity(count);
+    let mut offsets = Vec::with_capacity(count);
     let mut pos = 12usize;
     for _ in 0..count {
         let h = parse_entry_header(pack_bytes, pos)?;
-        let (_, used) = zlib::inflate(&pack_bytes[h.data_offset..], h.size as usize)?;
+        let (body, used) = zlib::inflate(&pack_bytes[h.data_offset..], h.size as usize)?;
         pos = h.data_offset + used;
+        offsets.push(h.entry_offset as u64);
         headers.push(h);
+        bodies.push(body);
     }
     let off_to_idx: HashMap<u64, usize> = headers
         .iter()
@@ -466,13 +478,14 @@ pub fn resolve_pack(
         .map(|(i, h)| (h.entry_offset as u64, i))
         .collect();
     let mut r = PackResolver {
-        pack: pack_bytes,
         headers,
+        bodies: &bodies,
         off_to_idx,
         oid_to_idx: HashMap::new(),
         resolved: vec![None; count],
         resolving: vec![false; count],
         resolve_ref,
+        used_external: false,
     };
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
@@ -480,7 +493,272 @@ pub fn resolve_pack(
         let oid = hash_object(obj.0, &obj.1);
         out.push((oid, obj.0, obj.1.clone()));
     }
-    Ok(out)
+    Ok(ResolvedPack {
+        objects: out,
+        offsets,
+        thin: r.used_external,
+    })
+}
+
+// ============================== delta creation ==============================
+
+/// Position index over a base buffer for delta matching: head/next hash
+/// chains over 8-byte keys at stride-DELTA_STRIDE positions.
+struct DeltaIndex {
+    head: Vec<i32>,
+    next: Vec<i32>,
+}
+
+const DELTA_STRIDE: usize = 4;
+const DELTA_HBITS: usize = 16;
+
+impl DeltaIndex {
+    fn build(base: &[u8]) -> DeltaIndex {
+        let mut head = vec![-1i32; 1 << DELTA_HBITS];
+        let mut next = vec![-1i32; base.len() / DELTA_STRIDE + 1];
+        for i in (0..base.len()).step_by(DELTA_STRIDE) {
+            if i + 8 > base.len() {
+                break;
+            }
+            let k = u64::from_le_bytes(base[i..i + 8].try_into().unwrap());
+            let h = (k.wrapping_mul(0x9E3779B97F4A7C15) >> (64 - DELTA_HBITS)) as usize;
+            next[i / DELTA_STRIDE] = head[h];
+            head[h] = i as i32;
+        }
+        DeltaIndex { head, next }
+    }
+}
+
+/// Create a git-format delta: varint(src_size) varint(tgt_size) followed by
+/// copy ops (0x80|flags + offset/size bytes) and literal inserts (1..=127).
+#[allow(dead_code)]
+pub fn create_delta(base: &[u8], target: &[u8]) -> Vec<u8> {
+    create_delta_idx(base, target, &DeltaIndex::build(base))
+}
+
+fn create_delta_idx(base: &[u8], target: &[u8], idx: &DeltaIndex) -> Vec<u8> {
+    let mut out = Vec::with_capacity(target.len() / 4 + 32);
+    write_le_varint(&mut out, base.len() as u64);
+    write_le_varint(&mut out, target.len() as u64);
+    if base.len() < 8 || target.is_empty() {
+        emit_insert(&mut out, target);
+        return out;
+    }
+    let DeltaIndex { head, next } = idx;
+    let mut i = 0usize; // target scan pos
+    let mut lit = 0usize; // start of pending literal run
+    while i + 8 <= target.len() {
+        let k = u64::from_le_bytes(target[i..i + 8].try_into().unwrap());
+        let h = (k.wrapping_mul(0x9E3779B97F4A7C15) >> (64 - DELTA_HBITS)) as usize;
+        let mut cand = head[h];
+        let mut best_len = 0usize;
+        let mut best_off = 0usize;
+        let mut probes = 0;
+        while cand >= 0 && probes < 4 {
+            let c = cand as usize;
+            // forward-extend the match in u64 chunks
+            let mut l = 0usize;
+            let maxl = (target.len() - i).min(base.len() - c);
+            while l + 8 <= maxl
+                && u64::from_le_bytes(base[c + l..c + l + 8].try_into().unwrap())
+                    == u64::from_le_bytes(target[i + l..i + l + 8].try_into().unwrap())
+            {
+                l += 8;
+            }
+            while l < maxl && base[c + l] == target[i + l] {
+                l += 1;
+            }
+            if l > best_len {
+                best_len = l;
+                best_off = c;
+            }
+            cand = next[c / DELTA_STRIDE];
+            probes += 1;
+        }
+        if best_len >= 12 {
+            if lit < i {
+                emit_insert(&mut out, &target[lit..i]);
+            }
+            emit_copy(&mut out, best_off, best_len);
+            i += best_len;
+            lit = i;
+        } else {
+            i += 1;
+            // literal op carries at most 127 bytes
+            if i - lit == 127 {
+                emit_insert(&mut out, &target[lit..i]);
+                lit = i;
+            }
+        }
+    }
+    if lit < target.len() {
+        emit_insert(&mut out, &target[lit..]);
+    }
+    out
+}
+
+fn write_le_varint(out: &mut Vec<u8>, mut v: u64) {
+    loop {
+        let mut b = (v & 0x7f) as u8;
+        v >>= 7;
+        if v != 0 {
+            b |= 0x80;
+        }
+        out.push(b);
+        if v == 0 {
+            break;
+        }
+    }
+}
+
+fn emit_insert(out: &mut Vec<u8>, mut data: &[u8]) {
+    while !data.is_empty() {
+        let n = data.len().min(127);
+        out.push(n as u8);
+        out.extend_from_slice(&data[..n]);
+        data = &data[n..];
+    }
+}
+
+fn emit_copy(out: &mut Vec<u8>, off: usize, mut size: usize) {
+    let mut off = off;
+    while size > 0 {
+        let n = size.min(0xFFFFFF);
+        let mut op = 0x80u8;
+        let mut bytes = [0u8; 7];
+        let mut nb = 0;
+        for b in 0..4 {
+            let v = (off >> (b * 8)) & 0xff;
+            if v != 0 {
+                op |= 1 << b;
+                bytes[nb] = v as u8;
+                nb += 1;
+            }
+        }
+        // size bytes come after offset bytes in the op layout:
+        // flags bits 0-3 = offset bytes, bits 4-6 = size bytes
+        let mut size_bytes = [0u8; 3];
+        let mut snb = 0;
+        for b in 0..3 {
+            let v = (n >> (b * 8)) & 0xff;
+            if v != 0 {
+                op |= 0x10 << b;
+                size_bytes[snb] = v as u8;
+                snb += 1;
+            }
+        }
+        out.push(op);
+        out.extend_from_slice(&bytes[..nb]);
+        out.extend_from_slice(&size_bytes[..snb]);
+        off += n;
+        size -= n;
+    }
+}
+
+/// Encode the OFS_DELTA negative-offset value (base-128 with +1 shifts).
+fn encode_ofs_delta(mut off: u64) -> Vec<u8> {
+    let mut bytes = vec![(off & 0x7f) as u8];
+    off >>= 7;
+    while off != 0 {
+        off -= 1;
+        bytes.push(0x80 | (off & 0x7f) as u8);
+        off >>= 7;
+    }
+    bytes.reverse();
+    bytes
+}
+
+/// Attempt delta compression when writing a pack: each object is tried
+/// against the previous WINDOW objects of the same type; the smallest
+/// delta under half the object's size wins.
+/// Returns (pack_bytes, oids_in_pack_order).
+pub fn write_pack_delta(objects: &[PackObj]) -> (Vec<u8>, Vec<Oid>) {
+    const WINDOW: usize = 10;
+    // order: commits first (checkout speed), then trees, blobs, tags;
+    // within a type, larger objects first so they serve as delta bases
+    fn rank(t: ObjType) -> u8 {
+        match t {
+            ObjType::Commit => 0,
+            ObjType::Tree => 1,
+            ObjType::Blob => 2,
+            ObjType::Tag => 3,
+        }
+    }
+    let mut order: Vec<usize> = (0..objects.len()).collect();
+    order.sort_by_key(|&i| {
+        (
+            rank(objects[i].ty),
+            std::cmp::Reverse(objects[i].data.len()),
+        )
+    });
+    let mut out = Vec::new();
+    out.extend_from_slice(b"PACK");
+    out.extend_from_slice(&2u32.to_be_bytes());
+    out.extend_from_slice(&(objects.len() as u32).to_be_bytes());
+    // per-type list of (order_index, pack_offset, lazy base index) —
+    // each base's DeltaIndex is built once and reused across candidates
+    type Recent = (usize, u64, std::rc::Rc<std::cell::OnceCell<DeltaIndex>>);
+    let mut recent: [Vec<Recent>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+    for &oi in &order {
+        let o = &objects[oi];
+        let r = rank(o.ty) as usize;
+        let mut best: Option<(u64, Vec<u8>)> = None; // (base pack offset, delta)
+        for (bi, boff, cell) in recent[r].iter().rev().take(WINDOW) {
+            let b = &objects[*bi];
+            // skip mismatched sizes — they never delta well; small objects
+            // need near-identical bases so gate tighter
+            let (lo, hi) = if o.data.len() < 8192 { (4, 4) } else { (8, 8) };
+            if b.data.len() > o.data.len() * hi + 64 || o.data.len() > b.data.len() * lo + 64 {
+                continue;
+            }
+            let idx = cell.get_or_init(|| DeltaIndex::build(&b.data));
+            let d = create_delta_idx(&b.data, &o.data, idx);
+            if d.len() * 2 < o.data.len() && best.as_ref().map(|x| d.len() < x.1.len()).unwrap_or(true)
+            {
+                best = Some((*boff, d));
+            }
+        }
+        let entry_off = out.len() as u64;
+        match best {
+            Some((boff, d)) => {
+                // OFS_DELTA header: type 6, size = delta byte length
+                write_entry_header(&mut out, OBJ_OFS_DELTA, d.len() as u64);
+                out.extend_from_slice(&encode_ofs_delta(entry_off - boff));
+                out.extend_from_slice(&zlib::deflate(&d));
+            }
+            None => {
+                write_entry_header(&mut out, obj_type_id(o.ty), o.data.len() as u64);
+                out.extend_from_slice(&zlib::deflate(&o.data));
+            }
+        }
+        recent[r].push((oi, entry_off, std::rc::Rc::new(std::cell::OnceCell::new())));
+        if recent[r].len() > WINDOW {
+            recent[r].remove(0);
+        }
+    }
+    let mut h = Sha1::new();
+    h.update(&out);
+    out.extend_from_slice(&h.finalize());
+    let oids = order.iter().map(|&i| objects[i].oid).collect();
+    (out, oids)
+}
+
+fn write_entry_header(out: &mut Vec<u8>, type_id: u8, mut size: u64) {
+    let mut first = (type_id << 4) | (size & 0x0f) as u8;
+    size >>= 4;
+    loop {
+        if size == 0 {
+            out.push(first);
+            break;
+        }
+        out.push(first | 0x80);
+        first = (size & 0x7f) as u8;
+        size >>= 7;
+    }
+}
+
+fn obj_type_id(t: ObjType) -> u8 {
+    t as u8
 }
 
 // ============================== pack + idx writing ==============================
@@ -493,6 +771,7 @@ pub struct PackObj {
 
 /// Write a pack v2 containing full (non-delta) objects. Returns (pack_bytes, entries_meta)
 /// where entries_meta = (oid, offset, crc32) for idx generation.
+#[allow(dead_code)]
 pub fn write_pack(objects: &[PackObj]) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(b"PACK");
@@ -527,6 +806,15 @@ pub fn write_pack(objects: &[PackObj]) -> Vec<u8> {
 /// were written to the pack — we recompute offsets by scanning).
 pub fn write_idx(pack_bytes: &[u8], oids: &[Oid]) -> Result<Vec<u8>> {
     let offsets = Pack::scan_entries(pack_bytes)?;
+    write_idx_offsets(pack_bytes, oids, &offsets)
+}
+
+/// Write idx v2 when entry offsets are already known (pack order).
+pub fn write_idx_offsets(
+    pack_bytes: &[u8],
+    oids: &[Oid],
+    offsets: &[u64],
+) -> Result<Vec<u8>> {
     let mut entries: Vec<(Oid, u64, u32)> = Vec::with_capacity(oids.len());
     for (i, &oid) in oids.iter().enumerate() {
         let start = offsets[i] as usize;
@@ -580,11 +868,43 @@ pub fn write_idx(pack_bytes: &[u8], oids: &[Oid]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Store a complete (non-thin) pack verbatim plus a generated idx into `dir`.
+/// Returns the pack file base name. `oids` must be in pack order.
+pub fn store_pack_bytes(
+    dir: &Path,
+    pack_bytes: &[u8],
+    oids: &[Oid],
+    offsets: &[u64],
+) -> Result<String> {
+    let hash = &pack_bytes[pack_bytes.len() - 20..];
+    let name = format!("pack-{}", crate::util::to_hex(hash));
+    let idx_bytes = write_idx_offsets(pack_bytes, oids, offsets)?;
+    std::fs::create_dir_all(dir)?;
+    let pack_path = dir.join(format!("{}.pack", name));
+    let idx_path = dir.join(format!("{}.idx", name));
+    if !pack_path.exists() {
+        std::fs::write(&pack_path, pack_bytes)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&pack_path, std::fs::Permissions::from_mode(0o444));
+        }
+    }
+    if !idx_path.exists() {
+        std::fs::write(&idx_path, &idx_bytes)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&idx_path, std::fs::Permissions::from_mode(0o444));
+        }
+    }
+    Ok(name)
+}
+
 /// Write a pack + idx into `dir` (e.g. .git/objects/pack). Returns the
 /// generated file base name.
 pub fn store_pack(dir: &Path, objects: &[PackObj]) -> Result<String> {
-    let pack_bytes = write_pack(objects);
-    let oids: Vec<Oid> = objects.iter().map(|o| o.oid).collect();
+    let (pack_bytes, oids) = write_pack_delta(objects);
     let idx_bytes = write_idx(&pack_bytes, &oids)?;
     let hash = &pack_bytes[pack_bytes.len() - 20..];
     let name = format!("pack-{}", crate::util::to_hex(hash));

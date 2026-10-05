@@ -71,12 +71,24 @@ fn diff_rec(
             ops.push((Op::Delete, aoff + pre + i));
         }
     } else {
-        let (x1, y1, x2, y2) = middle_snake(a, b);
-        diff_rec(&a[..x1], &b[..y1], aoff + pre, boff + pre, ops);
-        for i in x1..x2 {
-            ops.push((Op::Keep, aoff + pre + i));
+        match middle_snake(a, b) {
+            Some((x1, y1, x2, y2)) => {
+                diff_rec(&a[..x1], &b[..y1], aoff + pre, boff + pre, ops);
+                for i in x1..x2 {
+                    ops.push((Op::Keep, aoff + pre + i));
+                }
+                diff_rec(&a[x2..], &b[y2..], aoff + pre + x2, boff + pre + y2, ops);
+            }
+            // too expensive: emit a valid non-minimal diff
+            None => {
+                for i in 0..a.len() {
+                    ops.push((Op::Delete, aoff + pre + i));
+                }
+                for j in 0..b.len() {
+                    ops.push((Op::Insert, boff + pre + j));
+                }
+            }
         }
-        diff_rec(&a[x2..], &b[y2..], aoff + pre + x2, boff + pre + y2, ops);
     }
     let _ = base;
     // emit common suffix
@@ -85,9 +97,13 @@ fn diff_rec(
     }
 }
 
+/// Cap on Myers edit-script search depth (like xdiff's XDF_MAX_COST).
+/// Beyond this the diff falls back to a valid non-minimal form.
+const DIFF_MAX_COST: isize = 4096;
+
 /// Find the middle snake: returns (x1, y1, x2, y2) where the snake runs
-/// a[x1..x2] == b[y1..y2].
-fn middle_snake(a: &[&[u8]], b: &[&[u8]]) -> (usize, usize, usize, usize) {
+/// a[x1..x2] == b[y1..y2]. None when the search exceeds DIFF_MAX_COST.
+fn middle_snake(a: &[&[u8]], b: &[&[u8]]) -> Option<(usize, usize, usize, usize)> {
     let n = a.len() as isize;
     let m = b.len() as isize;
     let max = n + m;
@@ -105,7 +121,8 @@ fn middle_snake(a: &[&[u8]], b: &[&[u8]]) -> (usize, usize, usize, usize) {
     // from (n,m). Backward diagonals are centered on delta.
     vf[(off + 1) as usize] = 0;
     vb[(boff + delta + 1) as usize] = n + 1; // sentinel: d=0 starts at (n,m)
-    for d in 0..=(max + 1) / 2 {
+    let d_max = ((max + 1) / 2).min(DIFF_MAX_COST);
+    for d in 0..=d_max {
         // ---- forward: diagonals -d..d ----
         let mut k = -d;
         while k <= d {
@@ -128,7 +145,7 @@ fn middle_snake(a: &[&[u8]], b: &[&[u8]]) -> (usize, usize, usize, usize) {
                 && k <= delta + (d - 1)
                 && vb[(boff + k) as usize] <= x
             {
-                return (x0 as usize, y0 as usize, x as usize, y as usize);
+                return Some((x0 as usize, y0 as usize, x as usize, y as usize));
             }
             k += 2;
         }
@@ -157,13 +174,17 @@ fn middle_snake(a: &[&[u8]], b: &[&[u8]]) -> (usize, usize, usize, usize) {
             }
             vb[ki] = x;
             if !odd && k >= -d && k <= d && vf[(off + k) as usize] >= x {
-                return (x as usize, y as usize, x0 as usize, y0 as usize);
+                return Some((x as usize, y as usize, x0 as usize, y0 as usize));
             }
             k += 2;
         }
     }
-    // unreachable for valid inputs, but return a sane fallback
-    (0, 0, n as usize, m as usize)
+    if (max + 1) / 2 <= DIFF_MAX_COST {
+        // provably reachable for valid inputs
+        Some((0, 0, n as usize, m as usize))
+    } else {
+        None
+    }
 }
 
 // ============================== changed regions ==============================
