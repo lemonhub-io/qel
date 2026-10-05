@@ -19,7 +19,8 @@ const LOCAL_CMDS: &[&str] = &[
     "merge-file", "for-each-ref", "verify-pack", "index-pack",
     "unpack-objects", "pack-objects", "apply", "format-patch", "describe",
     "gc", "var", "check-ignore", "show-ref", "name-rev", "shortlog",
-    "blame", "annotate",
+    "blame", "annotate", "mktag", "rebase", "worktree", "bisect",
+    "submodule", "credential",
 ];
 
 const REMOTE_CMDS: &[&str] = &[
@@ -81,7 +82,7 @@ pub fn dispatch(args: &[String]) -> Result<i32> {
         return local::run(cmd, cmd_args);
     }
     Err(GitError::InvalidInput(format!(
-        "'{}' is not an qel command. See 'qel --help'.",
+        "'{}' is not a qel command. See 'qel --help'.",
         cmd
     )))
 }
@@ -214,6 +215,31 @@ pub fn format_commit(repo: &Repo, oid: &Oid, decorations: &BTreeMap<Oid, Vec<Str
     }
     out.push('\n');
     Ok(out)
+}
+
+/// Should we print ref decorations? git's --decorate defaults to "auto":
+/// only when output is a terminal.
+pub fn want_decorations(args: &[String]) -> bool {
+    use std::io::IsTerminal;
+    let mut mode = "auto";
+    for a in args {
+        match a.as_str() {
+            "--decorate" | "--decorate=short" | "--decorate=full" | "--decorate=auto" => {
+                if a == "--decorate=auto" {
+                    mode = "auto";
+                } else {
+                    mode = "on";
+                }
+            }
+            "--no-decorate" | "--decorate=no" => mode = "no",
+            _ => {}
+        }
+    }
+    match mode {
+        "on" => true,
+        "no" => false,
+        _ => std::io::stdout().is_terminal(),
+    }
 }
 
 /// Map commit oid -> ["HEAD -> main", "tag: v1", "origin/main", ...]
@@ -610,11 +636,13 @@ pub fn edit_message(repo: &Repo, initial: &str) -> Result<String> {
     Ok(normalize_message(&text))
 }
 
+#[allow(dead_code)]
 pub fn die(msg: &str) -> ! {
     eprintln!("{}", msg);
     std::process::exit(128)
 }
 
+#[allow(dead_code)]
 pub fn die_err(e: &GitError) -> ! {
     eprintln!("{}", e);
     std::process::exit(128)

@@ -310,7 +310,6 @@ pub fn render_hunks(a_data: &[u8], b_data: &[u8], context: usize) -> Vec<String>
         while ai < a_hi {
             write_line(&mut h, ' ', a_lines[ai]);
             ai += 1;
-            bj += 1;
         }
         out.push(h);
     }

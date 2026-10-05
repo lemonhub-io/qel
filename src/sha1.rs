@@ -118,6 +118,7 @@ impl Sha1 {
     }
 }
 
+#[allow(dead_code)]
 pub fn sha1(data: &[u8]) -> [u8; 20] {
     let mut h = Sha1::new();
     h.update(data);

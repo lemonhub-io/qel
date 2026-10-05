@@ -6,7 +6,7 @@
 
 use crate::object::{hash_object, ObjType, Oid};
 use crate::sha1::Sha1;
-use crate::util::{be_u32, be_u64, crc32, from_hex, GitError, Result};
+use crate::util::{be_u32, be_u64, crc32, GitError, Result};
 use crate::zlib;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -173,6 +173,7 @@ struct IdxData {
 }
 
 pub struct Pack {
+    #[allow(dead_code)]
     pub pack_path: PathBuf,
     pub data: Vec<u8>,
     idx: IdxData,
@@ -266,6 +267,7 @@ impl Pack {
         Ok(offs)
     }
 
+    #[allow(dead_code)]
     pub fn contains(&self, oid: &Oid) -> bool {
         self.find_offset(oid).is_some()
     }

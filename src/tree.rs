@@ -5,7 +5,7 @@ use crate::object::{parse_tree, serialize_tree, tree_entry_cmp, ObjType, Oid, Tr
 use crate::repo::Repo;
 use crate::util::{GitError, Result};
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Flatten a tree recursively into path -> (mode, oid).
 pub fn flatten_tree(repo: &Repo, tree: &Oid, prefix: &str, out: &mut BTreeMap<String, (u32, Oid)>) -> Result<()> {
@@ -185,7 +185,7 @@ pub fn checkout_tree(
 
 /// Is the working file different from what the index says? (used by checkout
 /// safety). Compares content hash if stat doesn't match.
-fn file_differs_from_index(repo: &Repo, fs_path: &Path, e: &IndexEntry) -> Result<bool> {
+fn file_differs_from_index(_repo: &Repo, fs_path: &Path, e: &IndexEntry) -> Result<bool> {
     let meta = match std::fs::symlink_metadata(fs_path) {
         Ok(m) => m,
         Err(_) => return Ok(true),

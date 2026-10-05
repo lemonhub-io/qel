@@ -3,7 +3,7 @@
 A complete Git implementation from scratch in Rust. **Zero dependencies** —
 everything is built on `std`: SHA-1, zlib (inflate *and* deflate), the object
 model, the index, refs, packfiles and delta chains, the pkt-line wire protocol,
-transports, and both ends of the protocol v0 negotiation.
+transports, and both ends of protocols v0 **and v2**.
 
 qel interoperates with real Git in both directions:
 
@@ -44,14 +44,14 @@ qel push https://github.com/me/repo.git main:main
 
 ```
 init add rm mv status commit log show diff branch tag checkout switch
-restore reset merge cherry-pick revert stash clean grep apply
-format-patch describe blame annotate shortlog gc
+restore reset merge cherry-pick revert rebase stash clean grep apply
+format-patch describe blame annotate shortlog gc worktree bisect submodule
 ```
 
 **Remote / protocol**
 
 ```
-clone fetch pull push ls-remote remote
+clone fetch pull push ls-remote remote credential
 upload-pack receive-pack daemon          # serve repositories to real git
 ```
 
@@ -61,7 +61,7 @@ upload-pack receive-pack daemon          # serve repositories to real git
 hash-object cat-file write-tree read-tree commit-tree rev-parse rev-list
 merge-base update-ref symbolic-ref ls-files ls-tree config for-each-ref
 show-ref name-rev reflog fsck count-objects pack-refs verify-pack
-index-pack unpack-objects pack-objects var check-ignore merge-file
+index-pack unpack-objects pack-objects var check-ignore merge-file mktag
 ```
 
 ### Serving a repository to real git
@@ -101,9 +101,11 @@ honors the usual environment variables: `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`,
 | Ignore | `.gitignore` wildcards, negation, dir-only rules, ancestor propagation, `$GIT_DIR/info/exclude` |
 | Diff | Myers diff (linear refinement), unified output byte-identical to git for tested cases |
 | Merge | merge-base (paint-down), fast-forward, true 3-way merge, conflict markers, `merge-file` |
-| Protocol | pkt-line, v0 ref advertisement, want/have negotiation (`multi_ack`, `multi_ack_detailed`), `side-band-64k`, `report-status`/`v2`, `delete-refs`, shallow-free fetch, peel lines |
+| Protocol | pkt-line; **v0** advertisement + want/have (`multi_ack`, `multi_ack_detailed`); **v2** `ls-refs`, `fetch`, `shallow-info`, `unborn`, `symref-target`, `peeled`, `wait-for-done`; `side-band-64k`, `report-status`/`v2`, `delete-refs`, `atomic`; **shallow clones** (`--depth`, `--deepen`, `--unshallow`, `.git/shallow`) |
 | Transports | `git://` TCP, `ssh://` + scp-style via `ssh` subprocess, `http(s)://` smart protocol via `curl`, local paths |
-| Server | `upload-pack`, `receive-pack` (validation, deny-current-branch, reflogs), `daemon` |
+| HTTP auth | `credential.helper` protocol (`fill`/`approve`/`reject` → `get`/`store`/`erase`), URL-embedded credentials, 401 retry, secrets via temp netrc |
+| Server | `upload-pack` (v0+v2, shallow), `receive-pack` (validation, deny-current-branch, reflogs), `daemon` |
+| Porcelain extras | `rebase` (+git-compatible state), `worktree`, `bisect` (`refs/bisect`), `submodule`, `gc` (reflog-aware repack/prune) |
 
 ## Interop status
 
@@ -113,25 +115,39 @@ Validated against Git 2.43.0:
   object stress test.
 - `git verify-pack` and `git index-pack --stdin --strict` accept qel packs.
 - `git clone`/`fetch`/`push` succeed against `qel daemon` and
-  `qel upload-pack`/`receive-pack` over `git://` and SSH.
+  `qel upload-pack`/`receive-pack` over `git://` and SSH — over protocol
+  v2 (git's default) and v0 (`GIT_PROTOCOL=version=0`).
 - qel `clone`/`fetch`/`push` succeed against `git daemon`, `git-http-backend`,
-  sshd, and github.com.
+  sshd, and github.com — v2 first, v0 fallback.
+- Shallow clones work both directions: `git clone --depth` from `qel daemon`,
+  `qel clone --depth` from `git daemon`, plus `fetch --deepen`/`--unshallow`.
 - `git stash pop` accepts stashes created by qel; `git am` accepts
   `qel format-patch` output; `git apply` accepts `qel diff` output and vice
   versa.
+- `git status`/`git rebase --continue` understand qel's in-progress rebase
+  state; `git worktree list`/`status` see qel-created worktrees;
+  `git for-each-ref` reads qel's `refs/bisect/*` marks; `git submodule
+  status` matches `qel submodule status` output exactly.
+- `git credential fill` and `qel credential fill` drive the same helpers
+  through the same `get`/`store`/`erase` ops and produce identical output.
 - Git reads index files written by qel and vice versa (v4 read tested).
 
 ## Known limitations
 
-- Protocol **v0** only — no protocol v2, no shallow clones (`--depth`),
-  no `filter`/`partial clone`.
+- Protocol v2 covers `ls-refs`/`fetch`/`object-info`; `deepen-since`,
+  `deepen-not`, `filter` (partial clone), `server-option` args and push-over-v2
+  are not implemented (receive-pack stays v0, matching git).
+- `rebase` replays linear histories; there is no interactive todo editing
+  (`-i` is accepted but equivalent to a plain pick sequence) and no
+  `--rebase-merges`.
+- `submodule` implements `status`/`init`/`update`/`add`; `deinit`, `foreach`,
+  `sync`, `summary`, `absorbgitdirs` and recursive update are not implemented.
+- `bisect` covers start/good/bad/skip/reset/log/replay; `bisect run` and
+  `bisect visualize` are not implemented.
+- `gc` repacks and prunes, but has no `--aggressive` delta window tuning or
+  cruft-pack handling; objects are always packed uncompressed.
 - `show`/`for-each-ref` output formatting differs slightly from git in places;
   plumbing output is designed to match where it matters.
-- `gc` is a no-op placeholder; `mktag` unsupported.
-- HTTP auth is via credentials embedded in the URL (or `.netrc`/curl); there is
-  no credential-helper integration.
-- Some advanced porcelain is intentionally simplified (interactive rebase,
-  submodule operations, bisect, worktrees beyond reading them).
 
 ## Documentation
 

@@ -40,6 +40,7 @@ pub fn err<T>(msg: impl Into<String>) -> Result<T> {
     Err(GitError::Parse(msg.into()))
 }
 
+#[allow(dead_code)]
 pub fn invalid<T>(msg: impl Into<String>) -> Result<T> {
     Err(GitError::InvalidInput(msg.into()))
 }

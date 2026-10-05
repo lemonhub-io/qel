@@ -97,6 +97,19 @@ impl Config {
         self.get(key).map(|v| parse_bool(&v))
     }
 
+    /// Subsection names of `[sec "..."]` headers (e.g. credential "url").
+    pub fn subsections(&self, sec: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for line in &self.lines {
+            if let Some((s, Some(sub))) = Config::parse_header(line.raw.trim()) {
+                if s == sec && !out.contains(&sub) {
+                    out.push(sub);
+                }
+            }
+        }
+        out
+    }
+
     /// Set `key=value`, replacing existing entries in this file.
     /// Creates the section if missing. Preserves unrelated lines.
     pub fn set(&mut self, key: &str, value: &str) -> Result<()> {
@@ -107,10 +120,7 @@ impl Config {
             None => format!("[{}]", sec),
         };
         let new_line = format!("\t{} = {}", name, value);
-        let mut cur_sec = String::new();
-        let mut cur_sub: Option<String> = None;
         let mut replaced = false;
-        let mut section_end: Option<usize> = None;
         let mut section_found = false;
         let mut out: Vec<Line> = Vec::new();
         for line in &self.lines {
@@ -121,9 +131,7 @@ impl Config {
                     out.push(Line { raw: new_line.clone() });
                     replaced = true;
                 }
-                cur_sec = s;
-                cur_sub = sb;
-                section_found = cur_sec == sec && cur_sub == sub;
+                section_found = s == sec && sb == sub;
                 out.push(line.clone());
                 continue;
             }
@@ -148,7 +156,6 @@ impl Config {
             out.push(Line { raw: header });
             out.push(Line { raw: new_line });
         }
-        let _ = section_end;
         self.lines = out;
         Ok(())
     }
@@ -193,6 +200,7 @@ impl Config {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -286,6 +294,7 @@ impl ConfigSet {
         None
     }
 
+    #[allow(dead_code)]
     pub fn get_bool(&self, key: &str) -> Option<bool> {
         for c in &self.configs {
             if let Some(v) = c.get_bool(key) {

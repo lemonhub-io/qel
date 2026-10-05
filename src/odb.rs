@@ -186,6 +186,7 @@ impl Odb {
     /// Read only the header: (type, size). Still decompresses, but avoids
     /// re-hashing — for loose objects we can stop early in theory; kept
     /// simple.
+    #[allow(dead_code)]
     pub fn read_header(&self, oid: &Oid) -> Result<(ObjType, usize)> {
         let obj = self.read(oid)?;
         Ok((obj.0, obj.1.len()))
@@ -274,6 +275,7 @@ impl Odb {
     }
 
     /// Loose-object hex for an oid string like "ab12..." -> path
+    #[allow(dead_code)]
     pub fn loose_object_exists(&self, oid: &Oid) -> bool {
         self.stores
             .iter()
@@ -281,6 +283,7 @@ impl Odb {
     }
 }
 
+#[allow(dead_code)]
 pub fn to_hex_short(oid: &Oid, len: usize) -> String {
     let h = to_hex(&oid.0);
     h[..len.min(40)].to_string()

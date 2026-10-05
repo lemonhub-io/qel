@@ -14,6 +14,9 @@ pub struct Repo {
     /// worktree root (None for bare)
     pub work_dir: Option<PathBuf>,
     pub odb: Odb,
+    /// cached .git/shallow contents
+    pub shallow:
+        std::cell::RefCell<Option<std::rc::Rc<std::collections::HashSet<Oid>>>>,
 }
 
 impl Repo {
@@ -87,7 +90,54 @@ impl Repo {
             git_dir,
             common_dir,
             work_dir,
+            shallow: std::cell::RefCell::new(None),
         })
+    }
+
+    // ---------------- shallow clones ----------------
+
+    /// Path of the .git/shallow file (lives in the common dir).
+    pub fn shallow_path(&self) -> PathBuf {
+        self.common_dir.join("shallow")
+    }
+
+    /// The set of shallow (grafted) commit oids. Empty when not a
+    /// shallow clone.
+    pub fn shallow_set(&self) -> std::rc::Rc<std::collections::HashSet<Oid>> {
+        if let Some(s) = self.shallow.borrow().as_ref() {
+            return s.clone();
+        }
+        let mut set = std::collections::HashSet::new();
+        if let Ok(text) = std::fs::read_to_string(self.shallow_path()) {
+            for line in text.lines() {
+                if let Ok(o) = Oid::from_hex(line.trim()) {
+                    set.insert(o);
+                }
+            }
+        }
+        let rc = std::rc::Rc::new(set);
+        *self.shallow.borrow_mut() = Some(rc.clone());
+        rc
+    }
+
+    /// True if this commit is at the shallow boundary (parents pruned).
+    pub fn is_shallow(&self, oid: &Oid) -> bool {
+        self.shallow_set().contains(oid)
+    }
+
+    /// Write .git/shallow; removes the file when the set is empty.
+    pub fn write_shallow(&self, set: &std::collections::HashSet<Oid>) -> Result<()> {
+        let path = self.shallow_path();
+        if set.is_empty() {
+            let _ = std::fs::remove_file(&path);
+        } else {
+            let mut lines: Vec<String> = set.iter().map(|o| o.hex()).collect();
+            lines.sort();
+            std::fs::write(&path, lines.join("\n") + "\n")?;
+        }
+        *self.shallow.borrow_mut() =
+            Some(std::rc::Rc::new(set.clone()));
+        Ok(())
     }
 
     pub fn work_dir(&self) -> Result<&Path> {
@@ -272,6 +322,7 @@ impl Repo {
 
     /// Peeled value for an annotated tag ref (from packed-refs ^{} lines)
     /// or the ref value itself.
+    #[allow(dead_code)]
     pub fn ref_peeled(&self, name: &str) -> Result<Option<Oid>> {
         for base in [&self.git_dir, &self.common_dir] {
             let packed = base.join("packed-refs");

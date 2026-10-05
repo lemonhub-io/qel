@@ -25,6 +25,7 @@ fn ref_path(repo: &Repo, name: &str) -> PathBuf {
     }
 }
 
+#[allow(dead_code)]
 pub fn ref_exists(repo: &Repo, name: &str) -> bool {
     matches!(repo.resolve_ref(name), Ok(Some(_)))
 }
@@ -222,8 +223,11 @@ pub fn read_reflog(repo: &Repo, name: &str) -> Vec<ReflogEntry> {
 pub struct ReflogEntry {
     pub old: Oid,
     pub new: Oid,
+    #[allow(dead_code)]
     pub who: String,
+    #[allow(dead_code)]
     pub time: i64,
+    #[allow(dead_code)]
     pub tz: String,
     pub msg: String,
 }

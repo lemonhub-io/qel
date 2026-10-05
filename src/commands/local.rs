@@ -63,17 +63,19 @@ pub fn run(cmd: &str, args: &[String]) -> Result<i32> {
         "apply" => cmd_apply(args),
         "format-patch" => cmd_format_patch(args),
         "describe" => cmd_describe(args),
-        "gc" => {
-            // no-op gc: objects stay loose/packed either way
-            Ok(0)
-        }
+        "gc" => cmd_gc(args),
         "var" => cmd_var(args),
         "check-ignore" => cmd_check_ignore(args),
-        "mktag" => Err(GitError::InvalidInput("mktag not supported".into())),
+        "mktag" => cmd_mktag(args),
         "show-ref" => cmd_show_ref(args),
         "name-rev" => cmd_name_rev(args),
         "shortlog" => cmd_log(args),
         "blame" | "annotate" => cmd_blame(args),
+        "credential" => crate::credential::run_command(args),
+        "rebase" => cmd_rebase(args),
+        "worktree" => cmd_worktree(args),
+        "bisect" => cmd_bisect(args),
+        "submodule" => cmd_submodule(args),
         _ => Err(GitError::InvalidInput(format!("unknown command: {}", cmd))),
     }
 }
@@ -639,7 +641,7 @@ fn cmd_commit(args: &[String]) -> Result<i32> {
         cmd_add(&["-u".to_string()])?;
     }
 
-    let mut index = Index::load(&repo.index_path())?;
+    let index = Index::load(&repo.index_path())?;
     if index.has_conflicts() {
         return Err(GitError::InvalidInput(
             "error: Committing is not possible because you have unmerged files.\nhint: Fix them up in the work tree, and then use 'git add/rm <file>'\nhint: as appropriate to mark resolution and make a commit.\nfatal: Exiting because of an unresolved conflict.".into(),
@@ -757,7 +759,7 @@ fn cmd_status(args: &[String]) -> Result<i32> {
     let st = worktree::compute_status(&repo, &ignore)?;
     if short || porcelain {
         let mut lines: Vec<String> = Vec::new();
-        let mut code_for = |staged: bool, kind: &str| -> char {
+        let code_for = |staged: bool, kind: &str| -> char {
             match (staged, kind) {
                 (true, "new file") => 'A',
                 (true, "modified") => 'M',
@@ -872,7 +874,6 @@ fn cmd_log(args: &[String]) -> Result<i32> {
                 max = args.get(i).and_then(|s| s.parse().ok());
             }
             "-p" | "-u" | "--patch" => patch = true,
-            "--patch" => patch = true,
             "--stat" => stat = true,
             "--name-only" => name_only = true,
             "--name-status" => name_status = true,
@@ -934,7 +935,11 @@ fn cmd_log(args: &[String]) -> Result<i32> {
     if let Some(m) = max {
         commits.truncate(m);
     }
-    let decs = decorations(&repo)?;
+    let decs = if want_decorations(args) {
+        decorations(&repo)?
+    } else {
+        BTreeMap::new()
+    };
     let mut out = String::new();
     for (n, oid) in commits.iter().enumerate() {
         let c = revwalk::load_commit(&repo, oid)?;
@@ -1017,7 +1022,11 @@ fn cmd_show(args: &[String]) -> Result<i32> {
     let obj = repo.odb.read(&oid)?;
     match obj.0 {
         ObjType::Commit => {
-            let decs = decorations(&repo)?;
+            let decs = if want_decorations(args) {
+                decorations(&repo)?
+            } else {
+                BTreeMap::new()
+            };
             print!("{}", format_commit(&repo, &oid, &decs)?);
             let c = revwalk::load_commit(&repo, &oid)?;
             let old_map = match c.parents.first() {
@@ -2785,15 +2794,13 @@ fn cmd_blame(args: &[String]) -> Result<i32> {
         // For each inserted line (present in this commit but not parent),
         // attribute blame if it corresponds to a still-unclaimed line.
         // Match by content to the current worktree lines.
-        let mut p_pos = 0usize;
         let mut t_pos = 0usize;
         for (op, _) in &ops {
             match op {
                 diff::Op::Keep => {
-                    p_pos += 1;
                     t_pos += 1;
                 }
-                diff::Op::Delete => p_pos += 1,
+                diff::Op::Delete => {}
                 diff::Op::Insert => {
                     let line = this_lines[t_pos];
                     let stripped: &[u8] = if line.ends_with(b"\n") {
@@ -3041,6 +3048,7 @@ enum PatchKind {
 struct ParsedPatch {
     old_path: String,
     new_path: String,
+    #[allow(dead_code)]
     old_mode: Option<u32>,
     new_mode: Option<u32>,
     kind: PatchKind,
@@ -3050,6 +3058,7 @@ struct ParsedPatch {
 struct Hunk {
     old_start: usize,
     old_count: usize,
+    #[allow(dead_code)]
     new_start: usize,
     lines: Vec<(char, Vec<u8>)>,
 }
@@ -3398,4 +3407,1412 @@ fn cmd_check_ignore(args: &[String]) -> Result<i32> {
         }
     }
     Ok(code)
+}
+
+// ============================== gc / mktag ==============================
+
+/// gc: repack all reachable objects into a single pack, drop loose
+/// objects and old packs, then pack-refs.
+fn cmd_gc(_args: &[String]) -> Result<i32> {
+    let repo = get_repo()?;
+    // tips: every ref tip, HEAD, reflog entries, index blobs
+    let mut tips: Vec<Oid> = repo.all_ref_oids()?;
+    if let Some(h) = repo.head_oid()? {
+        tips.push(h);
+    }
+    // reflog tips: both worktree-private and shared (common) logs
+    collect_reflog_tips(&repo.git_dir.join("logs"), &mut tips)?;
+    if repo.common_dir != repo.git_dir {
+        collect_reflog_tips(&repo.common_dir.join("logs"), &mut tips)?;
+    }
+    // index blobs
+    let index = Index::load(&repo.index_path())?;
+    for e in &index.entries {
+        tips.push(e.oid);
+    }
+    let objects = revwalk::reachable_objects(&repo, &tips)?;
+    let mut pack_objs = Vec::new();
+    for oid in &objects {
+        let obj = repo.odb.read(oid)?;
+        pack_objs.push(crate::pack::PackObj {
+            oid: *oid,
+            ty: obj.0,
+            data: obj.1.clone(),
+        });
+    }
+    if !pack_objs.is_empty() {
+        repo.odb.store_pack(&pack_objs)?;
+    }
+    // prune loose objects now covered by the pack
+    let objects_dir = repo.odb.primary_dir();
+    let mut pruned = 0usize;
+    for entry in std::fs::read_dir(objects_dir)? {
+        let sub = entry?;
+        let name = sub.file_name();
+        let n = name.to_string_lossy();
+        if n.len() != 2 || !n.bytes().all(|b| b.is_ascii_hexdigit()) || !sub.path().is_dir() {
+            continue;
+        }
+        for f in std::fs::read_dir(sub.path())? {
+            let f = f?;
+            let hex = format!("{}{}", n, f.file_name().to_string_lossy());
+            if let Ok(oid) = Oid::from_hex(&hex) {
+                if objects.contains(&oid) {
+                    // make writable then remove (loose objects are 0444)
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = std::fs::set_permissions(
+                            f.path(),
+                            std::fs::Permissions::from_mode(0o644),
+                        );
+                    }
+                    std::fs::remove_file(f.path())?;
+                    pruned += 1;
+                }
+            }
+        }
+        // drop now-empty fanout dir
+        let _ = std::fs::remove_dir(sub.path());
+    }
+    // drop old packs other than the fresh one — objects are all in it
+    let pack_dir = objects_dir.join("pack");
+    let mut packs: Vec<_> = std::fs::read_dir(&pack_dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .collect();
+    packs.sort_by_key(|e| e.file_name());
+    if packs.len() > 2 {
+        // keep the most recent pack+idx pair
+        for e in &packs[..packs.len() - 2] {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    e.path(),
+                    std::fs::Permissions::from_mode(0o644),
+                );
+            }
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+    refs::pack_refs(&repo)?;
+    eprintln!("pruned {} loose objects", pruned);
+    Ok(0)
+}
+
+fn collect_reflog_tips(dir: &std::path::Path, tips: &mut Vec<Oid>) -> Result<()> {
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    for e in std::fs::read_dir(dir)? {
+        let e = e?;
+        let p = e.path();
+        if p.is_dir() {
+            collect_reflog_tips(&p, tips)?;
+        } else if let Ok(text) = std::fs::read_to_string(&p) {
+            for line in text.lines() {
+                // reflog line: "<old> <new> <ident> <ts> <tz>\t<msg>" —
+                // both columns must stay reachable (fsck checks both)
+                for tok in line.split_whitespace().take(2) {
+                    if let Ok(o) = Oid::from_hex(tok) {
+                        if !o.is_zero() {
+                            tips.push(o);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// mktag: read a tag object from stdin, validate, store it.
+fn cmd_mktag(_args: &[String]) -> Result<i32> {
+    let repo = get_repo()?;
+    use std::io::Read;
+    let mut data = Vec::new();
+    std::io::stdin().read_to_end(&mut data)?;
+    let tag = Tag::parse(&data)?; // structural validation
+    if repo.odb.read_opt(&tag.object)?.is_none() {
+        return Err(GitError::InvalidInput(format!(
+            "tagged object {} does not exist",
+            tag.object.hex()
+        )));
+    }
+    let oid = repo.odb.write(ObjType::Tag, &data)?;
+    println!("{}", oid.hex());
+    Ok(0)
+}
+
+// ============================== rebase ==============================
+
+/// State for an in-progress rebase (git-compatible rebase-merge layout:
+/// real `git status`/`git rebase --continue` understands this dir).
+struct RebaseState {
+    dir: std::path::PathBuf,
+    head_name: String, // refs/heads/x the rebase will move
+    onto: Oid,
+    orig_head: Oid,
+    /// remaining "pick <oid> <subject>" entries
+    todo: Vec<(Oid, String)>,
+    msgnum: usize,
+    end: usize,
+}
+
+fn rebase_state_dir(repo: &Repo) -> std::path::PathBuf {
+    repo.git_dir.join("rebase-merge")
+}
+
+fn read_rebase_state(repo: &Repo) -> Result<Option<RebaseState>> {
+    let dir = rebase_state_dir(repo);
+    if !dir.is_dir() {
+        return Ok(None);
+    }
+    let rd = |n: &str| std::fs::read_to_string(dir.join(n)).unwrap_or_default();
+    let head_name = rd("head-name").trim().to_string();
+    let onto = Oid::from_hex(rd("onto").trim())?;
+    let orig_head = Oid::from_hex(rd("orig-head").trim())?;
+    let mut todo = Vec::new();
+    for line in rd("git-rebase-todo").lines() {
+        let l = line.trim();
+        if l.is_empty() || l.starts_with('#') {
+            continue;
+        }
+        let mut it = l.splitn(3, ' ');
+        let (Some("pick"), Some(sha), subj) = (it.next(), it.next(), it.next()) else {
+            continue;
+        };
+        if let Ok(o) = Oid::from_hex(sha) {
+            todo.push((o, subj.unwrap_or("").to_string()));
+        }
+    }
+    let msgnum = rd("msgnum").trim().parse().unwrap_or(1);
+    let end = rd("end").trim().parse().unwrap_or(todo.len() + msgnum - 1);
+    Ok(Some(RebaseState {
+        dir,
+        head_name,
+        onto,
+        orig_head,
+        todo,
+        msgnum,
+        end,
+    }))
+}
+
+fn write_rebase_state(_repo: &Repo, st: &RebaseState) -> Result<()> {
+    std::fs::create_dir_all(&st.dir)?;
+    std::fs::write(st.dir.join("head-name"), format!("{}\n", st.head_name))?;
+    std::fs::write(st.dir.join("onto"), format!("{}\n", st.onto.hex()))?;
+    std::fs::write(st.dir.join("orig-head"), format!("{}\n", st.orig_head.hex()))?;
+    std::fs::write(st.dir.join("msgnum"), format!("{}\n", st.msgnum))?;
+    std::fs::write(st.dir.join("end"), format!("{}\n", st.end))?;
+    let mut todo = String::new();
+    for (o, s) in &st.todo {
+        todo.push_str(&format!("pick {} {}\n", o.hex(), s));
+    }
+    std::fs::write(st.dir.join("git-rebase-todo"), todo)?;
+    Ok(())
+}
+
+/// Cherry-pick `oid` onto HEAD. Ok(true) = committed; Ok(false) = conflict.
+fn rebase_pick(repo: &Repo, oid: &Oid, label: &str) -> Result<bool> {
+    let c = revwalk::load_commit(repo, oid)?;
+    let parent = c.parents.first().copied();
+    let base_map = match parent {
+        Some(p) => commit_map(repo, &p)?,
+        None => BTreeMap::new(),
+    };
+    let head = repo.head_oid()?.ok_or_else(|| GitError::InvalidInput("no HEAD".into()))?;
+    let our_map = commit_map(repo, &head)?;
+    let their_map = commit_map(repo, oid)?;
+    let merge = merge_trees(repo, &base_map, &our_map, &their_map, "HEAD", label)?;
+    let work = repo.work_dir()?.to_path_buf();
+    apply_merge_to_index_worktree(repo, &merge, &work)?;
+    if !merge.conflicts.is_empty() {
+        return Ok(false);
+    }
+    let tree_oid = write_tree_from_map(repo, &merge.result_map)?;
+    let new_oid = create_commit(repo, tree_oid, vec![head], &c.message, Some(c.author.clone()))?;
+    refs::update_head(repo, &new_oid, &format!("rebase (pick): {}", c.summary()))?;
+    Ok(true)
+}
+
+fn cmd_rebase(args: &[String]) -> Result<i32> {
+    let repo = get_repo()?;
+    let mut mode: Option<&str> = None;
+    let mut onto_arg: Option<String> = None;
+    let mut pos = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--continue" => mode = Some("continue"),
+            "--abort" => mode = Some("abort"),
+            "--skip" => mode = Some("skip"),
+            "--quit" => mode = Some("quit"),
+            "--onto" => {
+                i += 1;
+                onto_arg = args.get(i).cloned();
+            }
+            s if s.starts_with("--onto=") => onto_arg = Some(s["--onto=".len()..].into()),
+            "-i" | "--interactive" => {}
+            "-q" | "--quiet" => {}
+            s if !s.starts_with('-') => pos.push(s.to_string()),
+            _ => {}
+        }
+        i += 1;
+    }
+    match mode {
+        Some("continue") => return rebase_continue(&repo),
+        Some("abort") => return rebase_abort(&repo),
+        Some("skip") => return rebase_skip(&repo),
+        Some("quit") => {
+            let dir = rebase_state_dir(&repo);
+            if dir.is_dir() {
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+            return Ok(0);
+        }
+        _ => {}
+    }
+    if rebase_state_dir(&repo).is_dir() {
+        return Err(GitError::InvalidInput(
+            "fatal: rebase in progress; use --continue/--abort".into(),
+        ));
+    }
+
+    // git rebase [<upstream> [<branch>]] or rebase --onto <o> <up> [<br>]
+    let upstream_spec = pos.first().cloned().ok_or_else(|| {
+        GitError::InvalidInput("usage: rebase [<upstream> [<branch>]]".into())
+    })?;
+    let branch_ref = pos.get(1).cloned();
+    let upstream = revision::rev_parse_commit(&repo, &upstream_spec)?;
+    let onto = match &onto_arg {
+        Some(o) => revision::rev_parse_commit(&repo, o)?,
+        None => upstream,
+    };
+    // commits to pick: upstream..branch tips, oldest first, non-merge only
+    let branch_oid = match &branch_ref {
+        Some(b) => revision::rev_parse_commit(&repo, b)?,
+        None => repo.head_oid()?.ok_or_else(|| GitError::InvalidInput("no HEAD".into()))?,
+    };
+    let orig_head = branch_oid;
+    let head_name = match &branch_ref {
+        Some(b) => format!("refs/heads/{}", b),
+        None => match repo.current_branch() {
+            Some(b) => format!("refs/heads/{}", b),
+            None => "detached HEAD".to_string(),
+        },
+    };
+    // commits in upstream are excluded
+    let mut exclude: std::collections::HashSet<Oid> = std::collections::HashSet::new();
+    for o in revwalk::rev_list(&repo, &[upstream])? {
+        exclude.insert(o);
+    }
+    let mut picks: Vec<(Oid, String)> = revwalk::rev_list(&repo, &[branch_oid])?
+        .into_iter()
+        .filter(|o| !exclude.contains(o))
+        .filter_map(|o| {
+            revwalk::load_commit(&repo, &o).ok().and_then(|c| {
+                if c.parents.len() > 1 {
+                    None
+                } else {
+                    Some((o, c.summary()))
+                }
+            })
+        })
+        .collect();
+    picks.reverse();
+    if picks.is_empty() {
+        eprintln!("Current branch {} is up to date.", pos.get(1).map(|s| s.as_str()).unwrap_or("HEAD"));
+        return Ok(0);
+    }
+
+    // safety: clean worktree required (untracked files are fine)
+    let (_, ignore) = repo_and_ignore()?;
+    let status = worktree::compute_status(&repo, &ignore)?;
+    if !status.staged.is_empty() || !status.unstaged.is_empty() || !status.unmerged.is_empty() {
+        return Err(GitError::InvalidInput(
+            "error: cannot rebase: You have unstaged changes.".into(),
+        ));
+    }
+
+    // detach HEAD at onto
+    let onto_tree = tree::peel_to_tree(&repo, &onto)?;
+    tree::checkout_tree(&repo, &onto_tree, true, false)?;
+    refs::update_head(&repo, &onto, &format!("rebase (start): checkout {}", onto.short(7)))?;
+
+    let total = picks.len();
+    let mut st = RebaseState {
+        dir: rebase_state_dir(&repo),
+        head_name,
+        onto,
+        orig_head,
+        todo: picks,
+        msgnum: 1,
+        end: total,
+    };
+    rebase_drive(&repo, &mut st)
+}
+
+/// Apply todo entries until empty or a conflict stops us.
+fn rebase_drive(repo: &Repo, st: &mut RebaseState) -> Result<i32> {
+    while let Some((oid, subj)) = st.todo.first().cloned() {
+        match rebase_pick(repo, &oid, &subj) {
+            Ok(true) => {
+                st.todo.remove(0);
+                st.msgnum += 1;
+            }
+            Ok(false) => {
+                write_rebase_state(repo, st)?;
+                eprintln!("error: could not apply {}... {}", oid.short(7), subj);
+                eprintln!("hint: Resolve all conflicts manually, mark them as resolved with");
+                eprintln!("hint: \"git add/rm <conflicted_files>\", then run \"git rebase --continue\".");
+                return Ok(1);
+            }
+            Err(e) => {
+                write_rebase_state(repo, st)?;
+                return Err(e);
+            }
+        }
+    }
+    rebase_finish(repo, st)
+}
+
+fn rebase_finish(repo: &Repo, st: &RebaseState) -> Result<i32> {
+    let head = repo.head_oid()?.ok_or_else(|| GitError::InvalidInput("no HEAD".into()))?;
+    if st.head_name != "detached HEAD" {
+        refs::update_ref(repo, &st.head_name, &head, None, "rebase finished")?;
+        refs::set_head_symbolic(repo, &st.head_name, "rebase finished")?;
+    }
+    let _ = std::fs::remove_dir_all(&st.dir);
+    println!("Successfully rebased and updated {}.", st.head_name);
+    Ok(0)
+}
+
+fn rebase_continue(repo: &Repo) -> Result<i32> {
+    let mut st = match read_rebase_state(repo)? {
+        Some(s) => s,
+        None => {
+            return Err(GitError::InvalidInput(
+                "fatal: no rebase in progress".into(),
+            ))
+        }
+    };
+    // unresolved conflicts still in the index? refuse to continue
+    let index = Index::load(&repo.index_path())?;
+    if index.entries.iter().any(|e| e.stage > 0) {
+        eprintln!("error: Committing is not possible because you have unmerged files.");
+        eprintln!("hint: Fix them up in the work tree, and then use 'git add/rm <file>'");
+        eprintln!("hint: as appropriate to mark resolution and make a commit.");
+        return Ok(1);
+    }
+    // If the worktree/index differs from HEAD, commit the resolution first
+    // (the stopped pick). Compare index tree vs HEAD tree.
+    if let Some((oid, subj)) = st.todo.first().cloned() {
+        let head = repo.head_oid()?;
+        let staged_tree = tree::write_tree_from_index(repo, &index)?;
+        let head_tree = head
+            .map(|h| revwalk::load_commit(repo, &h).map(|c| c.tree).unwrap_or(Oid::ZERO))
+            .unwrap_or(Oid::ZERO);
+        if staged_tree != head_tree {
+            // commit the user's resolution, preserving the original author+message
+            let c = revwalk::load_commit(repo, &oid)?;
+            if let Some(h) = head {
+                let new_oid =
+                    create_commit(repo, staged_tree, vec![h], &c.message, Some(c.author.clone()))?;
+                refs::update_head(repo, &new_oid, &format!("rebase (pick): {}", subj))?;
+            }
+        }
+        st.todo.remove(0);
+        st.msgnum += 1;
+    }
+    rebase_drive(repo, &mut st)
+}
+
+fn rebase_abort(repo: &Repo) -> Result<i32> {
+    let st = match read_rebase_state(repo)? {
+        Some(s) => s,
+        None => {
+            return Err(GitError::InvalidInput(
+                "fatal: no rebase in progress".into(),
+            ))
+        }
+    };
+    let tree = tree::peel_to_tree(repo, &st.orig_head)?;
+    tree::checkout_tree(repo, &tree, true, true)?;
+    if st.head_name != "detached HEAD" {
+        refs::update_ref(repo, &st.head_name, &st.orig_head, None, "rebase (abort)")?;
+        refs::set_head_symbolic(repo, &st.head_name, "rebase (abort)")?;
+    } else {
+        refs::update_head(repo, &st.orig_head, "rebase (abort)")?;
+    }
+    let _ = std::fs::remove_dir_all(&st.dir);
+    Ok(0)
+}
+
+fn rebase_skip(repo: &Repo) -> Result<i32> {
+    let mut st = match read_rebase_state(repo)? {
+        Some(s) => s,
+        None => {
+            return Err(GitError::InvalidInput(
+                "fatal: no rebase in progress".into(),
+            ))
+        }
+    };
+    if !st.todo.is_empty() {
+        st.todo.remove(0);
+        st.msgnum += 1;
+    }
+    // reset index/worktree to HEAD before continuing
+    if let Some(head) = repo.head_oid()? {
+        let tree = tree::peel_to_tree(repo, &head)?;
+        tree::checkout_tree(repo, &tree, true, true)?;
+    }
+    rebase_drive(repo, &mut st)
+}
+
+// ============================== worktree ==============================
+
+fn cmd_worktree(args: &[String]) -> Result<i32> {
+    let repo = get_repo()?;
+    let sub = args
+        .iter()
+        .find(|a| !a.starts_with('-'))
+        .map(|s| s.as_str())
+        .unwrap_or("list");
+    let rest: Vec<String> = args
+        .iter()
+        .skip_while(|a| *a != sub)
+        .skip(1)
+        .cloned()
+        .collect();
+    match sub {
+        "list" => worktree_list(&repo),
+        "add" => worktree_add(&repo, &rest),
+        "remove" | "rm" => worktree_remove(&repo, &rest),
+        "prune" => worktree_prune(&repo, &rest),
+        "lock" => worktree_lock(&repo, &rest, true),
+        "unlock" => worktree_lock(&repo, &rest, false),
+        _ => Err(GitError::InvalidInput(format!(
+            "usage: worktree add|list|remove|prune|lock|unlock"
+        ))),
+    }
+}
+
+/// All linked worktree admin dirs: (admin_dir, worktree_path).
+fn linked_worktrees(repo: &Repo) -> Vec<(std::path::PathBuf, String)> {
+    let mut out = Vec::new();
+    let dir = repo.common_dir.join("worktrees");
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            let admin = e.path();
+            let gd = admin.join("gitdir");
+            if let Ok(text) = std::fs::read_to_string(&gd) {
+                // gitdir file holds "<worktree>/.git"; strip trailing /.git
+                let p = text.trim();
+                let wt = p.strip_suffix("/.git").unwrap_or(p);
+                out.push((admin, wt.to_string()));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+fn worktree_describe(admin: &std::path::Path) -> String {
+    match std::fs::read_to_string(admin.join("HEAD")) {
+        Ok(t) => {
+            let t = t.trim();
+            if let Some(r) = t.strip_prefix("ref:") {
+                let name = r.trim().strip_prefix("refs/heads/").unwrap_or(r.trim());
+                format!("[{}]", name)
+            } else {
+                "(detached HEAD)".to_string()
+            }
+        }
+        Err(_) => "(unknown)".to_string(),
+    }
+}
+
+fn worktree_head_short(admin: &std::path::Path) -> String {
+    let wt_repo = Repo::open(admin, None);
+    let oid = wt_repo.ok().and_then(|r| r.head_oid().ok().flatten());
+    oid.map(|o| o.short(7).to_string())
+        .unwrap_or_else(|| "0000000".to_string())
+}
+
+fn worktree_list(repo: &Repo) -> Result<i32> {
+    let main_wt = repo
+        .work_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| repo.common_dir.display().to_string());
+    if repo.work_dir().is_err() || repo.config_get("core.bare").as_deref() == Some("true") {
+        println!("{}  -        (bare)", repo.common_dir.display());
+    } else {
+        println!(
+            "{}  {} {}",
+            main_wt,
+            worktree_head_short(&repo.git_dir),
+            worktree_describe(&repo.git_dir)
+        );
+    }
+    for (admin, wt) in linked_worktrees(repo) {
+        let locked = if admin.join("locked").exists() {
+            " locked"
+        } else {
+            ""
+        };
+        let prunable = if !std::path::Path::new(&wt).exists() {
+            " prunable"
+        } else {
+            ""
+        };
+        println!(
+            "{}  {} {}{}{}",
+            wt,
+            worktree_head_short(&admin),
+            worktree_describe(&admin),
+            locked,
+            prunable
+        );
+    }
+    Ok(0)
+}
+
+fn worktree_add(repo: &Repo, args: &[String]) -> Result<i32> {
+    let mut path: Option<String> = None;
+    let mut commitish: Option<String> = None;
+    let mut new_branch: Option<String> = None;
+    let mut detach = false;
+    let mut force = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-b" | "-B" => {
+                i += 1;
+                new_branch = args.get(i).cloned();
+            }
+            "--detach" | "-d" => detach = true,
+            "-f" | "--force" => force = true,
+            s if !s.starts_with('-') => {
+                if path.is_none() {
+                    path = Some(s.to_string());
+                } else {
+                    commitish = Some(s.to_string());
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let path = path.ok_or_else(|| {
+        GitError::InvalidInput("usage: worktree add <path> [<commit-ish>]".into())
+    })?;
+    let wt = std::path::PathBuf::from(&path);
+    if wt.join(".git").exists() {
+        return Err(GitError::InvalidInput(format!(
+            "fatal: '{}' already exists",
+            path
+        )));
+    }
+    let base = wt
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "worktree".to_string());
+
+    // determine commit + optional branch
+    let start = match &commitish {
+        Some(c) => revision::rev_parse_commit(repo, c)?,
+        None => repo
+            .head_oid()?
+            .ok_or_else(|| GitError::InvalidInput("no HEAD".into()))?,
+    };
+    // branch to check out: -b/-B, else commitish if it names a branch,
+    // else (no commitish) implicit branch named after the dir.
+    let mut branch_ref: Option<String> = None;
+    if let Some(b) = &new_branch {
+        let rn = format!("refs/heads/{}", b);
+        if args.iter().any(|a| a == "-B") || repo.resolve_ref(&rn)?.is_none() {
+            refs::update_ref(repo, &rn, &start, None, "worktree add: branch")?;
+        } else {
+            return Err(GitError::InvalidInput(format!(
+                "fatal: a branch named '{}' already exists",
+                b
+            )));
+        }
+        branch_ref = Some(rn);
+    } else if !detach {
+        if let Some(c) = &commitish {
+            let rn = format!("refs/heads/{}", c);
+            if repo.resolve_ref(&rn)? == Some(start) {
+                branch_ref = Some(rn);
+            }
+        } else {
+            let rn = format!("refs/heads/{}", base);
+            if repo.resolve_ref(&rn)?.is_none() {
+                refs::update_ref(repo, &rn, &start, None, "worktree add: branch")?;
+            }
+            branch_ref = Some(rn);
+        }
+    }
+    // refuse a branch already checked out elsewhere
+    if let Some(rn) = &branch_ref {
+        if !force {
+            if let Head::Symbolic(h) = repo.read_head()? {
+                if &h == rn {
+                    return Err(GitError::InvalidInput(format!(
+                        "fatal: '{}' is already checked out at '{}'",
+                        rn.strip_prefix("refs/heads/").unwrap_or(rn),
+                        repo.work_dir()?.display()
+                    )));
+                }
+            }
+            for (admin, wt) in linked_worktrees(repo) {
+                if let Ok(t) = std::fs::read_to_string(admin.join("HEAD")) {
+                    if t.trim() == format!("ref: {}", rn) {
+                        return Err(GitError::InvalidInput(format!(
+                            "fatal: '{}' is already checked out at '{}'",
+                            rn.strip_prefix("refs/heads/").unwrap_or(rn),
+                            wt
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
+    // admin dir
+    let wt_abs = if wt.is_absolute() {
+        wt.clone()
+    } else {
+        std::env::current_dir()?.join(&wt)
+    };
+    std::fs::create_dir_all(&wt_abs)?;
+    let admin = repo.common_dir.join("worktrees").join(&base);
+    let mut n = admin.clone();
+    let mut k = 1;
+    while n.exists() {
+        n = repo.common_dir.join("worktrees").join(format!("{}{}", base, k));
+        k += 1;
+    }
+    let admin = n;
+    std::fs::create_dir_all(&admin)?;
+    std::fs::write(admin.join("commondir"), "../..\n")?;
+    std::fs::write(
+        admin.join("gitdir"),
+        format!("{}\n", wt_abs.join(".git").display()),
+    )?;
+    std::fs::write(admin.join("ORIG_HEAD"), format!("{}\n", start.hex()))?;
+    let head_text = match &branch_ref {
+        Some(rn) => format!("ref: {}\n", rn),
+        None => format!("{}\n", start.hex()),
+    };
+    std::fs::write(admin.join("HEAD"), head_text)?;
+    std::fs::write(
+        wt_abs.join(".git"),
+        format!("gitdir: {}\n", admin.display()),
+    )?;
+
+    // checkout files + index in the new worktree
+    let wt_repo = Repo::open(&admin, Some(wt_abs.clone()))?;
+    let tree = tree::peel_to_tree(&wt_repo, &start)?;
+    // build map + write files (checkout_tree uses repo.index_path)
+    tree::checkout_tree(&wt_repo, &tree, true, true)?;
+    eprintln!("Preparing worktree ({} {})",
+        if branch_ref.is_some() { "checking out branch" } else { "detached HEAD" },
+        start.short(7));
+    println!("HEAD is now at {} {}", start.short(7),
+        revwalk::load_commit(repo, &start)?.summary());
+    Ok(0)
+}
+
+fn worktree_remove(repo: &Repo, args: &[String]) -> Result<i32> {
+    let mut force = false;
+    let mut target: Option<String> = None;
+    for a in args {
+        match a.as_str() {
+            "-f" | "--force" => force = true,
+            s if !s.starts_with('-') => target = Some(s.to_string()),
+            _ => {}
+        }
+    }
+    let target = target.ok_or_else(|| {
+        GitError::InvalidInput("usage: worktree remove <worktree>".into())
+    })?;
+    let target_can = std::fs::canonicalize(&target)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| target.clone());
+    let (admin, wt) = linked_worktrees(repo)
+        .into_iter()
+        .find(|(a, w)| {
+            let w_can = std::fs::canonicalize(w)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| w.clone());
+            w_can == target_can
+                || a.file_name().map(|s| s.to_string_lossy().to_string())
+                    == Some(target.clone())
+        })
+        .ok_or_else(|| {
+            GitError::InvalidInput(format!("fatal: '{}' is not a working tree", target))
+        })?;
+    if admin.join("locked").exists() && !force {
+        return Err(GitError::InvalidInput(format!(
+            "fatal: cannot remove a locked working tree, lock reason: {}",
+            std::fs::read_to_string(admin.join("locked")).unwrap_or_default()
+        )));
+    }
+    // cleanliness check
+    let wt_repo = Repo::open(&admin, Some(std::path::PathBuf::from(&wt)))?;
+    if !force {
+        let ignore = Ignore::new(std::path::Path::new(&wt), &admin, None);
+        let st = worktree::compute_status(&wt_repo, &ignore)?;
+        if !st.staged.is_empty() || !st.unstaged.is_empty() || !st.unmerged.is_empty() {
+            return Err(GitError::InvalidInput(format!(
+                "fatal: '{}' contains modified or untracked files, use --force to delete it",
+                target
+            )));
+        }
+    }
+    std::fs::remove_dir_all(&wt).ok();
+    std::fs::remove_dir_all(&admin)?;
+    Ok(0)
+}
+
+fn worktree_prune(repo: &Repo, _args: &[String]) -> Result<i32> {
+    for (admin, wt) in linked_worktrees(repo) {
+        if !std::path::Path::new(&wt).exists() {
+            let _ = std::fs::remove_dir_all(&admin);
+        }
+    }
+    Ok(0)
+}
+
+fn worktree_lock(repo: &Repo, args: &[String], lock: bool) -> Result<i32> {
+    let target = args.iter().find(|a| !a.starts_with('-')).cloned();
+    let target = match target {
+        Some(t) => t,
+        None => {
+            return Err(GitError::InvalidInput(
+                "usage: worktree lock|unlock <worktree>".into(),
+            ))
+        }
+    };
+    let target_can = std::fs::canonicalize(&target)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| target.clone());
+    for (admin, wt) in linked_worktrees(repo) {
+        let w_can = std::fs::canonicalize(&wt)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| wt.clone());
+        if w_can == target_can
+            || admin.file_name().map(|s| s.to_string_lossy().to_string()) == Some(target.clone())
+        {
+            if lock {
+                std::fs::write(admin.join("locked"), "")?;
+            } else {
+                let _ = std::fs::remove_file(admin.join("locked"));
+            }
+            return Ok(0);
+        }
+    }
+    Err(GitError::InvalidInput(format!(
+        "fatal: '{}' is not a working tree",
+        target
+    )))
+}
+
+// ============================== bisect ==============================
+
+fn bisect_terms(repo: &Repo) -> (String, String) {
+    let p = repo.git_dir.join("BISECT_TERMS");
+    if let Ok(t) = std::fs::read_to_string(&p) {
+        let mut it = t.lines();
+        let g = it.next().unwrap_or("good").to_string();
+        let b = it.next().unwrap_or("bad").to_string();
+        (g, b)
+    } else {
+        ("good".to_string(), "bad".to_string())
+    }
+}
+
+/// oids marked with `term` in refs/bisect/<term>-<oid>
+fn bisect_marked(repo: &Repo, term: &str) -> Result<Vec<Oid>> {
+    let mut out = Vec::new();
+    let prefix = format!("refs/bisect/{}-", term);
+    for (name, oid) in repo.list_refs("refs/bisect/")? {
+        if name.starts_with(&prefix) {
+            out.push(oid);
+        }
+    }
+    Ok(out)
+}
+
+fn bisect_in_progress(repo: &Repo) -> bool {
+    repo.git_dir.join("BISECT_START").exists()
+        || repo
+            .list_refs("refs/bisect/")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+}
+
+fn cmd_bisect(args: &[String]) -> Result<i32> {
+    let repo = get_repo()?;
+    let mut rest = args.to_vec();
+    let mut term_good = "good".to_string();
+    let mut term_bad = "bad".to_string();
+    rest.retain(|a| {
+        if let Some(v) = a.strip_prefix("--term-good=") {
+            term_good = v.to_string();
+            false
+        } else if let Some(v) = a.strip_prefix("--term-new=") {
+            term_good = v.to_string();
+            false
+        } else if let Some(v) = a.strip_prefix("--term-bad=") {
+            term_bad = v.to_string();
+            false
+        } else if let Some(v) = a.strip_prefix("--term-old=") {
+            term_bad = v.to_string();
+            false
+        } else {
+            true
+        }
+    });
+    let sub = rest.first().map(|s| s.as_str()).unwrap_or("");
+    match sub {
+        "start" => {
+            if bisect_in_progress(&repo) {
+                eprintln!("You need to run this command from the toplevel, or reset first.");
+            }
+            // save current head for reset
+            let head = match repo.read_head()? {
+                Head::Symbolic(n) => n,
+                Head::Detached(o) => o.hex().to_string(),
+            };
+            std::fs::write(repo.git_dir.join("BISECT_START"), format!("{}\n", head))?;
+            std::fs::write(
+                repo.git_dir.join("BISECT_TERMS"),
+                format!("{}\n{}\n", term_good, term_bad),
+            )?;
+            bisect_log(&repo, "start");
+            Ok(0)
+        }
+        s if s == term_good || s == "good" => {
+            for a in &rest[1..] {
+                if a.starts_with('-') {
+                    continue;
+                }
+                let oid = revision::rev_parse_commit(&repo, a)?;
+                bisect_mark(&repo, &term_good, &oid)?;
+                bisect_log(&repo, &format!("{} {}", term_good, oid.hex()));
+            }
+            if rest.len() == 1 {
+                // bare `bisect good` marks HEAD
+                if let Some(h) = repo.head_oid()? {
+                    bisect_mark(&repo, &term_good, &h)?;
+                    bisect_log(&repo, &format!("{} {}", term_good, h.hex()));
+                }
+            }
+            bisect_next(&repo)
+        }
+        s if s == term_bad || s == "bad" => {
+            let oid = match rest.get(1).filter(|a| !a.starts_with('-')) {
+                Some(a) => revision::rev_parse_commit(&repo, a)?,
+                None => repo.head_oid()?.ok_or_else(|| {
+                    GitError::InvalidInput("no HEAD".into())
+                })?,
+            };
+            bisect_mark(&repo, &term_bad, &oid)?;
+            bisect_log(&repo, &format!("{} {}", term_bad, oid.hex()));
+            bisect_next(&repo)
+        }
+        "skip" => {
+            let oid = match rest.get(1).filter(|a| !a.starts_with('-')) {
+                Some(a) => revision::rev_parse_commit(&repo, a)?,
+                None => repo.head_oid()?.ok_or_else(|| {
+                    GitError::InvalidInput("no HEAD".into())
+                })?,
+            };
+            bisect_mark(&repo, "skip", &oid)?;
+            bisect_log(&repo, &format!("skip {}", oid.hex()));
+            bisect_next(&repo)
+        }
+        "reset" => bisect_reset(&repo, rest.get(1).filter(|a| !a.starts_with('-'))),
+        "log" => {
+            if let Ok(t) = std::fs::read_to_string(repo.git_dir.join("BISECT_LOG")) {
+                print!("{}", t);
+            }
+            Ok(0)
+        }
+        "replay" => {
+            let file = rest.get(1).ok_or_else(|| {
+                GitError::InvalidInput("usage: bisect replay <file>".into())
+            })?;
+            let text = std::fs::read_to_string(file)?;
+            for line in text.lines() {
+                let words: Vec<String> = line
+                    .split_whitespace()
+                    .skip_while(|w| *w == "git" || *w == "bisect")
+                    .map(|s| s.to_string())
+                    .collect();
+                if !words.is_empty() {
+                    cmd_bisect(&words)?;
+                }
+            }
+            Ok(0)
+        }
+        _ => Err(GitError::InvalidInput(
+            "usage: bisect start|bad|good|skip|reset|log|replay".into(),
+        )),
+    }
+}
+
+fn bisect_mark(repo: &Repo, term: &str, oid: &Oid) -> Result<()> {
+    refs::update_ref(
+        repo,
+        &format!("refs/bisect/{}-{}", term, oid.hex()),
+        oid,
+        None,
+        &format!("bisect {}", term),
+    )
+}
+
+fn bisect_log(repo: &Repo, action: &str) {
+    let p = repo.git_dir.join("BISECT_LOG");
+    let mut text = std::fs::read_to_string(&p).unwrap_or_default();
+    text.push_str(&format!("git bisect {}\n", action));
+    let _ = std::fs::write(&p, text);
+}
+
+/// After each mark: either finish (first-bad found) or check out midpoint.
+fn bisect_next(repo: &Repo) -> Result<i32> {
+    let (good_term, bad_term) = bisect_terms(repo);
+    let bads = bisect_marked(repo, &bad_term)?;
+    let goods = bisect_marked(repo, &good_term)?;
+    let skips = bisect_marked(repo, "skip")?;
+    if bads.is_empty() || goods.is_empty() {
+        if bads.is_empty() && !goods.is_empty() {
+            eprintln!("You need to give me at least one {} revision.", bad_term);
+        }
+        return Ok(0);
+    }
+    // candidates: ancestors of (any) bad, excluding ancestors of goods/skips
+    let mut exclude: std::collections::HashSet<Oid> = std::collections::HashSet::new();
+    for g in goods.iter().chain(skips.iter()) {
+        for o in revwalk::rev_list(repo, &[*g])? {
+            exclude.insert(o);
+        }
+    }
+    let mut cands: Vec<Oid> = Vec::new();
+    for b in &bads {
+        for o in revwalk::rev_list(repo, &[*b])? {
+            if !exclude.contains(&o) && !cands.contains(&o) {
+                cands.push(o);
+            }
+        }
+    }
+    if cands.is_empty() {
+        // done — the (single) bad marker is the first bad commit
+        let first = bads[0];
+        let c = revwalk::load_commit(repo, &first)?;
+        println!("{} is the first {} commit", first.hex(), bad_term);
+        println!("commit {}", first.hex());
+        println!("{}", c.summary());
+        return Ok(0);
+    }
+    // pick midpoint: candidate whose ancestor-count (within set) is
+    // closest to half the total — approximates git's bisection weighting.
+    let set: std::collections::HashSet<Oid> = cands.iter().cloned().collect();
+    let n = cands.len();
+    let target = n / 2;
+    let mut best = cands[0];
+    let mut best_d = usize::MAX;
+    for c in &cands {
+        // count ancestors of c within the candidate set
+        let mut cnt = 0usize;
+        let mut stack = vec![*c];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(o) = stack.pop() {
+            if !seen.insert(o) {
+                continue;
+            }
+            if let Ok(cm) = revwalk::load_commit(repo, &o) {
+                for p in &cm.parents {
+                    if set.contains(p) {
+                        cnt += 1;
+                        stack.push(*p);
+                    }
+                }
+            }
+        }
+        let d = cnt.abs_diff(target);
+        if d < best_d {
+            best_d = d;
+            best = *c;
+        }
+    }
+    let steps = (usize::BITS - (n.max(1) - 1).leading_zeros()) as usize; // ceil-ish log2
+    eprintln!(
+        "Bisecting: {} revision{} left to test after this (roughly {} step{})",
+        n.saturating_sub(1),
+        if n - 1 == 1 { "" } else { "s" },
+        steps.saturating_sub(1),
+        if steps <= 2 { "" } else { "s" }
+    );
+    // detach HEAD at the pick
+    let (repo2, ignore) = repo_and_ignore()?;
+    let _ = (repo2, ignore);
+    let tree = tree::peel_to_tree(repo, &best)?;
+    tree::checkout_tree(repo, &tree, true, false)?;
+    refs::update_head(repo, &best, &format!("bisect: checkout {}", best.short(7)))?;
+    Ok(0)
+}
+
+fn bisect_reset(repo: &Repo, to: Option<&String>) -> Result<i32> {
+    // where to go back: explicit rev, or BISECT_START's saved head
+    let target = match to {
+        Some(s) => s.clone(),
+        None => std::fs::read_to_string(repo.git_dir.join("BISECT_START"))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| "HEAD".to_string()),
+    };
+    // clean refs/bisect + BISECT_* files
+    for (name, _) in repo.list_refs("refs/bisect/")? {
+        let _ = std::fs::remove_file(repo.git_dir.join(&name));
+    }
+    for f in [
+        "BISECT_START",
+        "BISECT_TERMS",
+        "BISECT_LOG",
+        "BISECT_RUN",
+        "BISECT_NAMES",
+    ] {
+        let _ = std::fs::remove_file(repo.git_dir.join(f));
+    }
+    // check out target
+    if target.starts_with("refs/") {
+        let oid = repo.resolve_ref(&target)?;
+        if let Some(o) = oid {
+            let tree = tree::peel_to_tree(repo, &o)?;
+            tree::checkout_tree(repo, &tree, true, false)?;
+        }
+        refs::set_head_symbolic(repo, &target, "bisect: reset")?;
+        eprintln!("Switched to branch '{}'",
+            target.strip_prefix("refs/heads/").unwrap_or(&target));
+    } else {
+        let oid = revision::rev_parse_commit(repo, &target)?;
+        let tree = tree::peel_to_tree(repo, &oid)?;
+        tree::checkout_tree(repo, &tree, true, false)?;
+        refs::update_head(repo, &oid, "bisect: reset")?;
+        eprintln!("Previous HEAD position was {}", oid.short(7));
+    }
+    Ok(0)
+}
+
+// ============================== submodule ==============================
+
+/// Parse .gitmodules into (name, path, url) tuples.
+fn gitmodules(repo: &Repo) -> Vec<(String, String, String)> {
+    let work = match repo.work_dir() {
+        Ok(w) => w.to_path_buf(),
+        Err(_) => return Vec::new(),
+    };
+    let text = match std::fs::read_to_string(work.join(".gitmodules")) {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    let mut name: Option<String> = None;
+    let mut path = String::new();
+    let mut url = String::new();
+    let mut flush = |name: &mut Option<String>, path: &mut String, url: &mut String| {
+        if let Some(n) = name.take() {
+            out.push((n, std::mem::take(path), std::mem::take(url)));
+        }
+    };
+    for line in text.lines() {
+        let l = line.trim();
+        if l.starts_with("[submodule") {
+            flush(&mut name, &mut path, &mut url);
+            if let Some(q) = l.split('"').nth(1) {
+                name = Some(q.to_string());
+            }
+        } else if let Some((k, v)) = l.split_once('=') {
+            match k.trim() {
+                "path" => path = v.trim().to_string(),
+                "url" => url = v.trim().to_string(),
+                _ => {}
+            }
+        }
+    }
+    flush(&mut name, &mut path, &mut url);
+    out
+}
+
+/// gitlink entries (mode 0160000) recorded in the index.
+fn index_gitlinks(repo: &Repo) -> Result<BTreeMap<String, Oid>> {
+    let index = Index::load(&repo.index_path())?;
+    let mut m = BTreeMap::new();
+    for e in index.entries {
+        if e.mode == 0o160000 {
+            m.insert(e.path, e.oid);
+        }
+    }
+    Ok(m)
+}
+
+fn cmd_submodule(args: &[String]) -> Result<i32> {
+    let repo = get_repo()?;
+    let sub = args
+        .iter()
+        .find(|a| !a.starts_with('-'))
+        .cloned()
+        .unwrap_or_else(|| "status".to_string());
+    let rest: Vec<String> = args
+        .iter()
+        .skip_while(|a| *a != &sub)
+        .skip(1)
+        .filter(|a| !a.starts_with('-'))
+        .cloned()
+        .collect();
+    match sub.as_str() {
+        "status" => submodule_status(&repo, &rest),
+        "init" => submodule_init(&repo, &rest),
+        "update" => submodule_update(&repo, &rest, args.iter().any(|a| a == "--init")),
+        "add" => submodule_add(&repo, &rest),
+        "absorbgitdirs" | "deinit" | "summary" | "foreach" | "sync" => {
+            eprintln!("qel: submodule {} is not implemented", sub);
+            Ok(1)
+        }
+        _ => Err(GitError::InvalidInput(
+            "usage: submodule add|status|init|update".into(),
+        )),
+    }
+}
+
+fn submodule_status(repo: &Repo, filter: &[String]) -> Result<i32> {
+    let links = index_gitlinks(repo)?;
+    let mods = gitmodules(repo);
+    let work = repo.work_dir()?;
+    // union of index gitlinks and .gitmodules paths
+    let mut paths: std::collections::BTreeSet<String> = links.keys().cloned().collect();
+    for (_, p, _) in &mods {
+        paths.insert(p.clone());
+    }
+    for p in paths {
+        if !filter.is_empty() && !filter.iter().any(|f| &p == f || p.starts_with(&format!("{}/", f))) {
+            continue;
+        }
+        let recorded = links.get(&p).copied();
+        let sub_dir = work.join(&p);
+        let sub_repo = Repo::discover(&sub_dir).ok();
+        let initialized = sub_repo
+            .as_ref()
+            .map(|r| r.common_dir != repo.common_dir || r.git_dir != repo.git_dir)
+            .unwrap_or(false);
+        let (prefix, oid, extra) = if !initialized {
+            (
+                '-',
+                recorded.unwrap_or(Oid::ZERO),
+                String::new(),
+            )
+        } else {
+            let r = sub_repo.unwrap();
+            let head = r.head_oid()?;
+            match (recorded, head) {
+                (Some(rec), Some(h)) if rec == h => {
+                    let desc = describe_or_branch(&r, &h);
+                    (' ', rec, desc)
+                }
+                (Some(_), Some(h)) => {
+                    let desc = describe_or_branch(&r, &h);
+                    ('+', h, desc)
+                }
+                (Some(rec), None) => (' ', rec, String::new()),
+                (None, Some(h)) => ('+', h, String::new()),
+                (None, None) => continue,
+            }
+        };
+        println!("{}{} {}{}", prefix, oid.hex(), p, extra);
+    }
+    Ok(0)
+}
+
+/// Set a key in the repo's local config file.
+fn config_set(repo: &Repo, key: &str, value: &str) -> Result<()> {
+    let path = repo.common_dir.join("config");
+    let mut cfg = crate::config::Config::load(&path);
+    cfg.set(key, value)?;
+    cfg.save()
+}
+
+fn describe_or_branch(repo: &Repo, oid: &Oid) -> String {
+    // "(heads/master)" when HEAD or a branch points at oid
+    if let Some(b) = repo.current_branch() {
+        if repo.resolve_ref(&format!("refs/heads/{}", b)).ok().flatten() == Some(*oid) {
+            return format!(" (heads/{})", b);
+        }
+    }
+    for (name, o) in repo.list_refs("refs/heads/").unwrap_or_default() {
+        if o == *oid {
+            return format!(" (heads/{})", name.strip_prefix("refs/heads/").unwrap_or(&name));
+        }
+    }
+    for (name, o) in repo.list_refs("refs/tags/").unwrap_or_default() {
+        if o == *oid {
+            return format!(" (tags/{})", name.strip_prefix("refs/tags/").unwrap_or(&name));
+        }
+    }
+    String::new()
+}
+
+fn submodule_init(repo: &Repo, filter: &[String]) -> Result<i32> {
+    for (name, path, url) in gitmodules(repo) {
+        if !filter.is_empty() && !filter.contains(&path) {
+            continue;
+        }
+        let key = format!("submodule.{}.url", name);
+        if repo.local_config().get(&key).is_none() {
+            config_set(repo, &key, &url)?;
+            eprintln!(
+                "Submodule '{}' ({}) registered for path '{}'",
+                name, url, path
+            );
+        }
+        config_set(repo, &format!("submodule.{}.path", name), &path)?;
+    }
+    Ok(0)
+}
+
+fn submodule_update(repo: &Repo, filter: &[String], init: bool) -> Result<i32> {
+    let mods = gitmodules(repo);
+    let links = index_gitlinks(repo)?;
+    let work = repo.work_dir()?.to_path_buf();
+    let mut rc = 0;
+    for (name, path, url) in &mods {
+        if !filter.is_empty() && !filter.iter().any(|f| f == path || f == name) {
+            continue;
+        }
+        let url = if url.is_empty() {
+            repo.config_get(&format!("submodule.{}.url", name))
+                .unwrap_or_default()
+        } else {
+            url.clone()
+        };
+        let sub_dir = work.join(path);
+        let have_repo = sub_dir.join(".git").exists();
+        if !have_repo {
+            if url.is_empty() {
+                eprintln!("fatal: no url found for submodule path '{}' in .gitmodules", path);
+                rc = 1;
+                continue;
+            }
+            if init {
+                let _ = config_set(repo, &format!("submodule.{}.url", name), &url);
+            }
+            // clone into sub_dir using the normal clone machinery
+            let abs_url = if url.starts_with("./") || url.starts_with("../") {
+                // relative submodule url — resolved against the
+                // superproject's remote url, or its own directory.
+                let origin = repo
+                    .config_get("remote.origin.url")
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| work.display().to_string());
+                let mut base = origin.trim_end_matches('/').to_string();
+                for seg in url.split('/') {
+                    match seg {
+                        "." | "" => {}
+                        ".." => {
+                            if let Some(pos) = base.rfind('/') {
+                                base.truncate(pos);
+                            }
+                        }
+                        s => {
+                            base.push('/');
+                            base.push_str(s);
+                        }
+                    }
+                }
+                base
+            } else {
+                url
+            };
+            eprintln!("Cloning into '{}'...", path);
+            let rc_clone = crate::commands::remote::run(
+                "clone",
+                &[abs_url, sub_dir.display().to_string()],
+            )?;
+            if rc_clone != 0 {
+                rc = rc_clone;
+                continue;
+            }
+        }
+        // checkout the recorded gitlink commit (detached)
+        if let Some(want) = links.get(path) {
+            let sub_repo = Repo::discover(&sub_dir)?;
+            // Repo::discover walks up — make sure we found a repo
+            // actually rooted at the submodule dir.
+            if sub_repo.work_dir().map(|w| w != sub_dir.as_path()).unwrap_or(true) {
+                continue;
+            }
+            let cur = sub_repo.head_oid()?;
+            if cur != Some(*want) {
+                let tree = tree::peel_to_tree(&sub_repo, want)?;
+                tree::checkout_tree(&sub_repo, &tree, true, true)?;
+                refs::update_head(&sub_repo, want, "submodule: checkout")?;
+                eprintln!("Submodule path '{}': checked out '{}'", path, want.hex());
+            }
+        }
+    }
+    Ok(rc)
+}
+
+fn submodule_add(repo: &Repo, args: &[String]) -> Result<i32> {
+    // submodule add <url> [<path>]
+    let url = args.first().ok_or_else(|| {
+        GitError::InvalidInput("usage: submodule add <url> [<path>]".into())
+    })?;
+    let path = args.get(1).cloned().unwrap_or_else(|| {
+        url.trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or("sub")
+            .trim_end_matches(".git")
+            .to_string()
+    });
+    let work = repo.work_dir()?;
+    let dst = work.join(&path);
+    crate::commands::remote::run("clone", &[url.clone(), dst.display().to_string()])?;
+    let sub_repo = Repo::discover(&dst)?;
+    let head = sub_repo
+        .head_oid()?
+        .ok_or_else(|| GitError::InvalidInput("empty submodule".into()))?;
+    // record gitlink in index
+    let mut index = Index::load(&repo.index_path())?;
+    let meta = std::fs::symlink_metadata(&dst)?;
+    let mut e = crate::index::entry_from_stat(&meta, head, &path);
+    e.mode = 0o160000;
+    index.insert_sorted(e);
+    index.sort();
+    index.save(&repo.index_path())?;
+    // append to .gitmodules
+    let gm = work.join(".gitmodules");
+    let mut text = std::fs::read_to_string(&gm).unwrap_or_default();
+    text.push_str(&format!(
+        "[submodule \"{}\"]\n\tpath = {}\n\turl = {}\n",
+        path, path, url
+    ));
+    std::fs::write(&gm, text)?;
+    // stage .gitmodules
+    let gm_oid = {
+        let data = std::fs::read(&gm)?;
+        repo.odb.write(ObjType::Blob, &data)?
+    };
+    let mut index = Index::load(&repo.index_path())?;
+    let meta = std::fs::symlink_metadata(&gm)?;
+    index.insert_sorted(crate::index::entry_from_stat(&meta, gm_oid, ".gitmodules"));
+    index.sort();
+    index.save(&repo.index_path())?;
+    Ok(0)
 }

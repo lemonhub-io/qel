@@ -10,7 +10,7 @@ use crate::revwalk;
 use crate::transport::{self, Url};
 use crate::tree;
 use crate::util::{GitError, Result};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::io::Write;
 
 pub fn run(cmd: &str, args: &[String]) -> Result<i32> {
@@ -54,6 +54,7 @@ fn cmd_clone(args: &[String]) -> Result<i32> {
     let mut origin = "origin".to_string();
     let mut positional = Vec::new();
     let mut branch: Option<String> = None;
+    let mut depth: Option<u32> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -66,6 +67,13 @@ fn cmd_clone(args: &[String]) -> Result<i32> {
             "-b" | "--branch" => {
                 i += 1;
                 branch = Some(args[i].clone());
+            }
+            "--depth" => {
+                i += 1;
+                depth = args[i].parse().ok();
+            }
+            s if s.starts_with("--depth=") => {
+                depth = s["--depth=".len()..].parse().ok();
             }
             "--mirror" => bare = true,
             s if !s.starts_with('-') => positional.push(s.to_string()),
@@ -90,9 +98,79 @@ fn cmd_clone(args: &[String]) -> Result<i32> {
     }
 
     match &url {
-        Url::Local { path } => clone_local(src, path, &dst, bare, &origin, branch, quiet),
-        _ => clone_remote(&url, &dst, bare, &origin, branch, quiet),
+        Url::Local { path } if depth.is_none() => {
+            clone_local(src, path, &dst, bare, &origin, branch, quiet)
+        }
+        Url::Local { path } => {
+            clone_local_shallow(src, path, &dst, bare, &origin, branch, depth, quiet)
+        }
+        _ => clone_remote(&url, &dst, bare, &origin, branch, depth, quiet),
     }
+}
+
+/// Local-path clone with --depth: filter the copied object set in-process.
+fn clone_local_shallow(
+    src: &str,
+    path: &str,
+    dst: &std::path::Path,
+    bare: bool,
+    origin: &str,
+    branch: Option<String>,
+    depth: Option<u32>,
+    _quiet: bool,
+) -> Result<i32> {
+    let mut src_path = std::path::PathBuf::from(path);
+    if !src_path.join("HEAD").exists() {
+        src_path = src_path.join(".git");
+    }
+    let src_repo = Repo::open(&src_path, None)?;
+    let refs = src_repo.list_refs("refs/")?;
+    let head_branch = src_repo.current_branch();
+    let head_oid = src_repo.head_oid()?.flatten_oid();
+    let repo = init_target(
+        dst,
+        bare,
+        branch.as_deref().or(head_branch.as_deref()).unwrap_or("master"),
+    )?;
+    let tips: Vec<Oid> = refs.iter().map(|(_, o)| *o).collect();
+    let d = depth.unwrap_or(0).max(1);
+    let boundary = protocol::shallow_boundary(&src_repo, &tips, d)?;
+    let boundary_set: HashSet<Oid> = boundary.iter().copied().collect();
+    // copy objects for commits within depth
+    let mut objects: HashSet<Oid> = HashSet::new();
+    for oid in revwalk::reachable_objects(&src_repo, &tips)? {
+        // drop commits below the boundary (they're not in this repo's copy)
+        objects.insert(oid);
+    }
+    // remove commits strictly below the boundary
+    for b in &boundary {
+        if let Ok(c) = revwalk::load_commit(&src_repo, b) {
+            for p in &c.parents {
+                for o in revwalk::reachable_objects(&src_repo, &[*p])? {
+                    objects.remove(&o);
+                }
+            }
+        }
+    }
+    let mut pack_objs = Vec::new();
+    for oid in &objects {
+        if let Some(obj) = src_repo.odb.read_opt(oid)? {
+            pack_objs.push(crate::pack::PackObj {
+                oid: *oid,
+                ty: obj.0,
+                data: obj.1.clone(),
+            });
+        }
+    }
+    if !pack_objs.is_empty() {
+        repo.odb.store_pack(&pack_objs)?;
+    }
+    // mark boundary commits shallow (their stored parents must be pruned
+    // on read — write .git/shallow AFTER storing objects)
+    repo.write_shallow(&boundary_set)?;
+    setup_cloned_refs(&repo, &refs, &src_repo, bare, origin, head_oid, head_branch, branch)?;
+    configure_remote(&repo, src, origin, bare)?;
+    Ok(0)
 }
 
 /// Clone from a local repository path.
@@ -240,33 +318,26 @@ fn configure_remote(repo: &Repo, url: &str, origin: &str, bare: bool) -> Result<
     Ok(())
 }
 
-/// Clone from a remote URL via the wire protocol.
+/// Clone from a remote URL via the wire protocol (v2 preferred).
 fn clone_remote(
     url: &Url,
     dst: &std::path::Path,
     bare: bool,
     origin: &str,
     branch: Option<String>,
+    depth: Option<u32>,
     quiet: bool,
 ) -> Result<i32> {
     if !quiet {
         eprintln!("Cloning into '{}'...", dst.display());
     }
-    let url_str = match url {
-        Url::Http { url } => url.clone(),
-        Url::Git { host, port, path } => format!("git://{}:{}{}", host, port, path),
-        Url::Ssh { user, host, port, path } => match (user, port) {
-            (Some(u), Some(p)) => format!("ssh://{}@{}:{}{}", u, host, p, path),
-            (Some(u), None) => format!("ssh://{}@{}{}", u, host, path),
-            (None, Some(p)) => format!("ssh://{}:{}{}", host, p, path),
-            (None, None) => format!("ssh://{}{}", host, path),
-        },
-        Url::Local { path } => path.clone(),
-    };
-    // get advertisement first to learn default branch before init
-    let (_, ad) = protocol::advertise(url, "git-upload-pack")?;
+    let url_str = url_display(url);
+    // session does the advertisement (ls-refs under v2)
+    let mut session = protocol::open_fetch_session(url, None)?;
     let head_branch = branch.clone().or_else(|| {
-        ad.head_target
+        session
+            .ad
+            .head_target
             .as_ref()
             .and_then(|t| t.strip_prefix("refs/heads/").map(|s| s.to_string()))
     });
@@ -278,10 +349,10 @@ fn clone_remote(
 
     // wants: every advertised ref tip (+HEAD)
     let mut want_set: HashSet<Oid> = HashSet::new();
-    for (_, oid) in &ad.refs {
+    for (_, oid) in &session.ad.refs {
         want_set.insert(*oid);
     }
-    for (_, oid) in &ad.peeled {
+    for (_, oid) in &session.ad.peeled {
         want_set.insert(*oid);
     }
     let wants: Vec<Oid> = want_set.into_iter().collect();
@@ -290,18 +361,25 @@ fn clone_remote(
         configure_remote(&repo, &url_str, origin, bare)?;
         return Ok(0);
     }
-    let (pack, ad) = protocol::fetch_pack(url, &wants, &[], quiet)?;
-    protocol::store_received_pack(&repo, &pack, quiet)?;
+    let mut req = protocol::FetchRequest::new(wants, Vec::new());
+    req.deepen = depth;
+    let res = session.fetch(&req, quiet)?;
+    session.finish().ok();
+    protocol::store_received_pack(&repo, &res.pack, quiet)?;
+    // write .git/shallow for depth-limited clones
+    if depth.is_some() {
+        let shallow: HashSet<Oid> = res.shallow.iter().copied().collect();
+        repo.write_shallow(&shallow)?;
+    }
 
     // map remote refs to local names
+    let ad = &session.ad;
     let src_refs: Vec<(String, Oid)> = ad
         .refs
         .iter()
         .filter(|(n, _)| n != "HEAD")
         .cloned()
         .collect();
-    let ad_map: BTreeMap<String, Oid> = ad.refs.iter().cloned().collect();
-    let _ = ad_map;
     setup_cloned_refs(
         &repo,
         &src_refs,
@@ -328,21 +406,36 @@ fn cmd_fetch(args: &[String]) -> Result<i32> {
     let mut remote_name = "origin".to_string();
     let mut refspecs: Vec<String> = Vec::new();
     let mut quiet = false;
-    for a in args {
-        match a.as_str() {
+    let mut depth: Option<u32> = None;
+    let mut unshallow = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
             "-q" | "--quiet" => quiet = true,
             "--all" => {}
             "-p" | "--prune" => {}
             "-t" | "--tags" => {}
+            "--depth" | "--deepen" => {
+                i += 1;
+                depth = args[i].parse().ok();
+            }
+            "--unshallow" => unshallow = true,
+            s if s.starts_with("--depth=") || s.starts_with("--deepen=") => {
+                depth = s[s.find('=').unwrap() + 1..].parse().ok();
+            }
             s if !s.starts_with('-') && remote_name == "origin" => {
                 remote_name = s.to_string()
             }
             s if !s.starts_with('-') => refspecs.push(s.to_string()),
             _ => {}
         }
+        i += 1;
     }
     let url_str = remote_url(&repo, &remote_name)?;
     let url = transport::parse_url(&url_str)?;
+    if unshallow && repo.shallow_set().is_empty() {
+        return Ok(0); // not shallow: --unshallow is a no-op
+    }
     let refspec = if refspecs.is_empty() {
         repo.config_get(&format!("remote.{}.fetch", remote_name))
             .unwrap_or_else(|| {
@@ -351,7 +444,7 @@ fn cmd_fetch(args: &[String]) -> Result<i32> {
     } else {
         refspecs.join(" ")
     };
-    fetch_from(&repo, &url, &remote_name, &refspec, quiet)
+    fetch_from(&repo, &url, &remote_name, &refspec, depth, unshallow, quiet)
 }
 
 /// Parse "src:dst" refspec halves (handles leading '+').
@@ -375,11 +468,13 @@ fn fetch_from(
     url: &Url,
     remote_name: &str,
     refspec: &str,
+    depth: Option<u32>,
+    unshallow: bool,
     quiet: bool,
 ) -> Result<i32> {
     match url {
         Url::Local { path } => fetch_local(repo, path, remote_name, refspec, quiet),
-        _ => fetch_remote(repo, url, remote_name, refspec, quiet),
+        _ => fetch_remote(repo, url, remote_name, refspec, depth, unshallow, quiet),
     }
 }
 
@@ -388,9 +483,12 @@ fn fetch_remote(
     url: &Url,
     remote_name: &str,
     refspec: &str,
+    depth: Option<u32>,
+    unshallow: bool,
     quiet: bool,
 ) -> Result<i32> {
-    let (_, ad) = protocol::advertise(url, "git-upload-pack")?;
+    let mut session = protocol::open_fetch_session(url, Some(&repo.common_dir.join("config")))?;
+    let ad = session.ad.clone();
     let specs = parse_refspec(refspec);
     // expand globs: "+refs/heads/*:refs/remotes/origin/*"
     let mut updates: Vec<(String, Oid, String)> = Vec::new(); // (local ref, remote oid, remote name)
@@ -420,10 +518,42 @@ fn fetch_remote(
             }
         }
     }
-    if !wants.is_empty() {
-        let haves = repo.all_ref_oids()?;
-        let (pack, _) = protocol::fetch_pack(url, &wants.into_iter().collect::<Vec<_>>(), &haves, quiet)?;
-        protocol::store_received_pack(repo, &pack, quiet)?;
+    let need_fetch = !wants.is_empty() || depth.is_some() || unshallow;
+    if need_fetch {
+        // --unshallow fetches complete history; --depth applies a limit.
+        // When shallow already, --depth N means deepen by N from the
+        // current boundary — the server handles that via our shallow set.
+        let mut haves = repo.all_ref_oids()?;
+        let our_shallow: Vec<Oid> = repo.shallow_set().iter().copied().collect();
+        // deepen requests include the shallow boundary in wants so the
+        // server knows which commits to deepen below
+        let mut want_vec: Vec<Oid> = wants.iter().copied().collect();
+        if depth.is_some() {
+            want_vec.extend(our_shallow.iter().copied());
+        }
+        haves.extend(our_shallow.iter().copied());
+        let mut req = protocol::FetchRequest::new(want_vec, haves);
+        req.deepen = depth;
+        req.shallow = our_shallow.clone();
+        let res = session.fetch(&req, quiet)?;
+        session.finish().ok();
+        protocol::store_received_pack(repo, &res.pack, quiet)?;
+        // maintain .git/shallow
+        if depth.is_some() || !res.unshallow.is_empty() || !res.shallow.is_empty() {
+            let mut set: HashSet<Oid> = our_shallow.iter().copied().collect();
+            for o in &res.unshallow {
+                set.remove(o);
+            }
+            for o in &res.shallow {
+                set.insert(*o);
+            }
+            if unshallow {
+                set.clear();
+            }
+            repo.write_shallow(&set)?;
+        } else if unshallow {
+            repo.write_shallow(&HashSet::new())?;
+        }
     }
     // update refs (empty local = FETCH_HEAD only)
     let mut fetch_head = String::new();
@@ -656,6 +786,14 @@ fn cmd_push(args: &[String]) -> Result<i32> {
     // resolve updates: (remote ref, old remote oid, new oid)
     let mut updates: Vec<(String, Oid, Oid)> = Vec::new();
     let mut delete_refs: Vec<String> = Vec::new();
+    // `push -d origin <ref>` deletes each named ref
+    if delete {
+        for spec in &refspecs {
+            let dst = spec.strip_prefix(':').unwrap_or(spec);
+            delete_refs.push(normalize_remote_ref(dst));
+        }
+        refspecs.clear();
+    }
     for spec in &refspecs {
         let (f, spec_body) = match spec.strip_prefix('+') {
             Some(r) => (true, r),
@@ -708,7 +846,7 @@ fn push_remote(
     set_upstream: bool,
     quiet: bool,
 ) -> Result<i32> {
-    let (_, ad) = protocol::advertise(url, "git-receive-pack")?;
+    let (_, ad) = protocol::advertise(url, "git-receive-pack", Some(&repo.common_dir.join("config")))?;
     // fill in old values from advertisement; check fast-forward
     let mut want_tips = Vec::new();
     let remote_tips: Vec<Oid> = ad.refs.iter().map(|(_, o)| *o).collect();
@@ -743,8 +881,13 @@ fn push_remote(
         println!("Everything up-to-date");
         return Ok(0);
     }
-    let pack = protocol::build_pack_for_push(repo, &want_tips, &remote_tips)?;
-    let (unpack, results) = protocol::push(url, &final_updates, &pack, quiet)?;
+    // pack is sent iff at least one update has a non-zero new value
+    let pack = if want_tips.is_empty() {
+        Vec::new()
+    } else {
+        protocol::build_pack_for_push(repo, &want_tips, &remote_tips)?
+    };
+    let (unpack, results) = protocol::push(url, &final_updates, &pack, Some(&repo.common_dir.join("config")), quiet)?;
     if !unpack.is_empty() && unpack != "ok" {
         return Err(GitError::Protocol(format!("remote unpack failed: {}", unpack)));
     }
@@ -913,7 +1056,9 @@ fn cmd_ls_remote(args: &[String]) -> Result<i32> {
             }
         }
         _ => {
-            let (_, ad) = protocol::advertise(&url, "git-upload-pack")?;
+            let mut session = protocol::open_fetch_session(&url, repo.map(|r| r.common_dir.join("config")).as_deref())?;
+            let ad = session.ad.clone();
+            session.finish().ok();
             if let Some(h) = ad.head_oid {
                 println!("{} HEAD", h.hex());
             }
@@ -1062,13 +1207,27 @@ fn cmd_upload_pack(args: &[String]) -> Result<i32> {
     let path = path
         .ok_or_else(|| GitError::InvalidInput("usage: upload-pack <dir>".into()))?;
     let repo = open_server_repo(&path)?;
+    // GIT_PROTOCOL=version=2 → serve protocol v2 (ssh/http set this)
+    let v2 = std::env::var("GIT_PROTOCOL")
+        .map(|v| v.eq_ignore_ascii_case("version=2"))
+        .unwrap_or(false);
     let stdout = std::io::stdout();
     let mut w = stdout.lock();
     if advertise {
+        if v2 {
+            return protocol::advertise_refs_v2(&mut w).map(|_| 0);
+        }
         return protocol::advertise_refs(&repo, "git-upload-pack", &mut w).map(|_| 0);
     }
     let stdin = std::io::stdin();
     let mut r = stdin.lock();
+    if v2 {
+        if stateless {
+            return protocol::serve_upload_pack_stateless_v2(&repo, &mut r, &mut w)
+                .map(|_| 0);
+        }
+        return protocol::serve_upload_pack_v2(&repo, &mut r, &mut w).map(|_| 0);
+    }
     if stateless {
         return protocol::serve_upload_pack_stateless(&repo, &mut r, &mut w).map(|_| 0);
     }
@@ -1219,9 +1378,14 @@ fn serve_daemon_conn(
     let service = it.next().unwrap_or("");
     let req_path = it.next().unwrap_or("");
     let mut extra_args: Vec<String> = Vec::new();
+    let mut version2 = false;
     for p in parts {
-        // skip host= / version= ; collect extra (e.g. end-of-options)
-        if p.is_empty() || p.starts_with("host=") || p.starts_with("version=") {
+        let p = p.trim_end_matches('\0');
+        if p.is_empty() || p.starts_with("host=") {
+            continue;
+        }
+        if let Some(v) = p.strip_prefix("version=") {
+            version2 = v == "2";
             continue;
         }
         extra_args.push(p.to_string());
@@ -1291,7 +1455,13 @@ fn serve_daemon_conn(
     };
     let repo = Repo::open(&git_dir, work)?;
     match service {
-        "git-upload-pack" => protocol::serve_upload_pack(&repo, &mut r, &mut w),
+        "git-upload-pack" => {
+            if version2 {
+                protocol::serve_upload_pack_v2(&repo, &mut r, &mut w)
+            } else {
+                protocol::serve_upload_pack(&repo, &mut r, &mut w)
+            }
+        }
         _ => protocol::serve_receive_pack(&repo, &mut r, &mut w),
     }
 }

@@ -71,15 +71,22 @@ worktree.rs    directory scan honoring ignore rules, file hashing (blob form),
 ```
 pktline.rs     4-hex-length framing, flush/delim packets, read_until_flush
 transport.rs   Url parsing (git://, ssh://, scp-like, http(s), file://),
-               Conn = Tcp | spawned-ssh duplex, HTTP(S) via curl subprocess
-               (GET info/refs, POST service), GIT_SSH(_COMMAND) honored
+               Conn = Tcp | spawned-ssh duplex | PeekConn (v2 probe
+               read-ahead), HTTP(S) via curl subprocess (GET info/refs,
+               POST service), GIT_SSH(_COMMAND) honored, temp-netrc auth
+credential.rs  credential.helper protocol: fill/approve/reject →
+               get/store/erase ops, credential.<url>.helper matching,
+               !shell and git credential-<name> helper forms
 protocol.rs    client: advertisement parse (caps, symrefs, peeled),
                want/have request build, ACK/NAK + side-band demux,
-               report-status parse, pack building for push, thin packs
+               report-status parse, pack building for push, thin packs;
+               FetchSession unifies v0 streaming conns, stateless v0/v2
+               HTTP, and v2 ls-refs/fetch command sessions
                server: advertisement write, upload-pack session (wants,
-               haves→ACK, side-band-64k pack), receive-pack session
-               (commands, streaming pack read, ref validation+reflog,
-               report-status v1/v2)
+               haves→ACK, side-band-64k pack, shallow/deepen replies),
+               v2 capability + ls-refs/fetch command serving, receive-pack
+               session (commands, streaming pack read, ref
+               validation+reflog, report-status v1/v2)
 ```
 
 `read_pack_stream` deserves a note: receive-pack cannot `read_to_end` (the
@@ -106,8 +113,16 @@ matching git's fatal-exit convention.
 
 - No external crates, no FFI, no unsafe except where edition-2024 requires it
   (`std::env::set_var`).
-- No shelling out to git for core behavior — `ssh`, `curl`, and an `ssh`
-  binary for the ssh transport are the only spawned tools.
+- No shelling out to git for core behavior — `ssh`/`GIT_SSH` for transport,
+  `curl` for HTTP(S), and configured `credential.helper`s are the only
+  spawned tools.
+- Shallow state is a single `.git/shallow` file read once into a cached
+  `Rc<HashSet<Oid>>` on `Repo`; every parent traversal (rev-list,
+  merge-base, pack closure) consults it, matching git's grafted-commit
+  semantics.
+- Command state directories reuse git's own layout (`rebase-merge`,
+  `refs/bisect/*`, `BISECT_*`, `worktrees/<id>`) so a repository stays
+  fully understandable to real git mid-operation.
 - Object writes are atomic (temp file + rename) and stored read-only (0444),
   like real git.
 - Where behavior is ambiguous, match `git` 2.43 output exactly (diff headers,

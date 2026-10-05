@@ -5,6 +5,7 @@ use std::io::{Read, Write};
 
 pub const FLUSH: &[u8] = b"0000";
 pub const DELIM: &[u8] = b"0001";
+#[allow(dead_code)]
 pub const RESPONSE_END: &[u8] = b"0002";
 
 pub fn encode(data: &[u8]) -> Vec<u8> {
@@ -47,6 +48,7 @@ pub fn read(r: &mut dyn Read) -> Result<Option<Vec<u8>>> {
 }
 
 /// Read all pkt-lines until flush.
+#[allow(dead_code)]
 pub fn read_until_flush(r: &mut dyn Read) -> Result<Vec<Vec<u8>>> {
     let mut out = Vec::new();
     while let Some(d) = read(r)? {
@@ -58,6 +60,7 @@ pub fn read_until_flush(r: &mut dyn Read) -> Result<Vec<Vec<u8>>> {
     Ok(out)
 }
 
+#[allow(dead_code)]
 pub fn write_all(w: &mut dyn Write, lines: &[Vec<u8>]) -> Result<()> {
     for l in lines {
         w.write_all(&encode(l))?;

@@ -9,7 +9,7 @@ use crate::util::{GitError, Result};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Advertisement {
     /// refname -> oid (refs/... plus HEAD, symref targets resolved later)
     pub refs: Vec<(String, Oid)>,
@@ -101,12 +101,16 @@ pub fn parse_advertisement(r: &mut dyn Read) -> Result<Advertisement> {
 }
 
 /// HTTP: GET info/refs and strip the service banner.
-pub fn http_advertisement(base_url: &str, service: &str) -> Result<Advertisement> {
+pub fn http_advertisement(
+    local: Option<&std::path::Path>,
+    base_url: &str,
+    service: &str,
+) -> Result<Advertisement> {
     let url = format!("{}/info/refs?service={}", base_url.trim_end_matches('/'), service);
-    let resp = transport::http_get(&url, &[])?;
+    let resp = transport::http_authed(local, "GET", &url, &[], None)?;
     if resp.status == 401 || resp.status == 403 {
         return Err(GitError::Protocol(format!(
-            "authentication required ({}) — put credentials in the URL (https://user:pass@host/...)",
+            "authentication required ({}) — check credentials / credential.helper",
             resp.status
         )));
     }
@@ -134,13 +138,6 @@ pub fn http_advertisement(base_url: &str, service: &str) -> Result<Advertisement
     Ok(ad)
 }
 
-/// Open fetch (upload-pack) connection for streaming transports.
-pub fn open_fetch_conn(url: &Url) -> Result<(Conn, Advertisement)> {
-    let mut conn = transport::connect(url, "git-upload-pack")?;
-    let ad = parse_advertisement(&mut conn)?;
-    Ok((conn, ad))
-}
-
 /// Open push (receive-pack) connection for streaming transports.
 pub fn open_push_conn(url: &Url) -> Result<(Conn, Advertisement)> {
     let mut conn = transport::connect(url, "git-receive-pack")?;
@@ -149,9 +146,13 @@ pub fn open_push_conn(url: &Url) -> Result<(Conn, Advertisement)> {
 }
 
 /// Get an advertisement regardless of transport.
-pub fn advertise(url: &Url, service: &str) -> Result<(Option<Conn>, Advertisement)> {
+pub fn advertise(
+    url: &Url,
+    service: &str,
+    local: Option<&std::path::Path>,
+) -> Result<(Option<Conn>, Advertisement)> {
     match url {
-        Url::Http { url } => Ok((None, http_advertisement(url, service)?)),
+        Url::Http { url } => Ok((None, http_advertisement(local, url, service)?)),
         _ => {
             let mut conn = transport::connect(url, service)?;
             let ad = parse_advertisement(&mut conn)?;
@@ -165,6 +166,21 @@ pub fn advertise(url: &Url, service: &str) -> Result<(Option<Conn>, Advertisemen
 pub struct FetchRequest {
     pub wants: Vec<Oid>,
     pub haves: Vec<Oid>,
+    /// --depth N ("deepen" request); None for full history
+    pub deepen: Option<u32>,
+    /// our currently-shallow commit oids (sent as "shallow" lines)
+    pub shallow: Vec<Oid>,
+}
+
+impl FetchRequest {
+    pub fn new(wants: Vec<Oid>, haves: Vec<Oid>) -> Self {
+        FetchRequest {
+            wants,
+            haves,
+            deepen: None,
+            shallow: Vec::new(),
+        }
+    }
 }
 
 /// Build the upload-pack request body (pkt-lines).
@@ -202,6 +218,14 @@ pub fn build_fetch_request(
         } else {
             out.extend_from_slice(&pktline::encode_str(&format!("want {}\n", w.hex())));
         }
+    }
+    if let Some(d) = req.deepen {
+        if caps.contains("shallow") || caps.is_empty() {
+            out.extend_from_slice(&pktline::encode_str(&format!("deepen {}\n", d)));
+        }
+    }
+    for s in &req.shallow {
+        out.extend_from_slice(&pktline::encode_str(&format!("shallow {}\n", s.hex())));
     }
     out.extend_from_slice(pktline::FLUSH);
     for h in &req.haves {
@@ -281,7 +305,8 @@ impl<'a> PeekReader<'a> {
             return Ok(false);
         }
         let body = self.peek(8)?;
-        Ok(body.len() >= 8 && (&body[4..8] == b"ACK " || &body[4..8] == b"NAK\n"))
+        Ok(body.len() >= 8
+            && matches!(&body[4..8], b"ACK " | b"NAK\n" | b"shal" | b"unsh"))
     }
 
     fn read_to_end(&mut self) -> Result<Vec<u8>> {
@@ -291,14 +316,24 @@ impl<'a> PeekReader<'a> {
     }
 }
 
+/// Result of reading an upload-pack response (v0 or v2).
+#[derive(Default)]
+pub struct FetchResponse {
+    pub pack: Vec<u8>,
+    pub shallow: Vec<Oid>,
+    pub unshallow: Vec<Oid>,
+}
+
 /// Read the upload-pack response: ACK/NAK lines then pack (possibly
-/// side-band-64k multiplexed). Returns raw pack bytes.
+/// side-band-64k multiplexed).
 pub fn read_fetch_response(
     r: &mut dyn Read,
     side_band: bool,
     quiet: bool,
-) -> Result<Vec<u8>> {
+) -> Result<FetchResponse> {
     let mut pack = Vec::new();
+    let mut shallow = Vec::new();
+    let mut unshallow = Vec::new();
     let mut pr = PeekReader::new(r);
     if side_band {
         // everything is pkt-framed: ACK/NAK lines and band packets
@@ -310,16 +345,39 @@ pub fn read_fetch_response(
             if s.starts_with("ACK") || s.starts_with("NAK") {
                 continue;
             }
+            if let Some(rest) = s.trim_end().strip_prefix("shallow ") {
+                if let Ok(o) = Oid::from_hex(rest) {
+                    shallow.push(o);
+                    continue;
+                }
+            }
+            if let Some(rest) = s.trim_end().strip_prefix("unshallow ") {
+                if let Ok(o) = Oid::from_hex(rest) {
+                    unshallow.push(o);
+                    continue;
+                }
+            }
             handle_band_packet(&line, &mut pack, quiet)?;
         }
     } else {
-        // pkt-framed ACK/NAK lines, then raw PACK bytes
+        // pkt-framed ACK/NAK/shallow lines, then raw PACK bytes
         while pr.next_is_ack()? {
-            let _ = pr.read_pkt()?;
+            if let Some(line) = pr.read_pkt()? {
+                let s = String::from_utf8_lossy(&line).trim_end().to_string();
+                if let Some(rest) = s.strip_prefix("shallow ") {
+                    if let Ok(o) = Oid::from_hex(rest) {
+                        shallow.push(o);
+                    }
+                } else if let Some(rest) = s.strip_prefix("unshallow ") {
+                    if let Ok(o) = Oid::from_hex(rest) {
+                        unshallow.push(o);
+                    }
+                }
+            }
         }
         pack = pr.read_to_end()?;
     }
-    Ok(pack)
+    Ok(FetchResponse { pack, shallow, unshallow })
 }
 
 fn handle_band_packet(line: &[u8], pack: &mut Vec<u8>, quiet: bool) -> Result<()> {
@@ -349,49 +407,233 @@ fn handle_band_packet(line: &[u8], pack: &mut Vec<u8>, quiet: bool) -> Result<()
     Ok(())
 }
 
-/// Perform a fetch over a streaming transport or HTTP.
-/// Returns (raw pack bytes, advertisement).
-pub fn fetch_pack(
+/// An open fetch session: holds the advertisement and (for streaming
+/// transports) the connection. Protocol v2 when the server supports it.
+pub struct FetchSession {
+    pub ad: Advertisement,
+    v2: bool,
+    http: Option<String>,
+    conn: Option<Conn>,
+    /// repo config path for credential helpers (None outside a repo)
+    local: Option<std::path::PathBuf>,
+}
+
+impl FetchSession {
+    /// Issue a fetch: wants/haves/depth and return pack + shallow updates.
+    pub fn fetch(&mut self, req: &FetchRequest, quiet: bool) -> Result<FetchResponse> {
+        if self.v2 {
+            let args = fetch_v2_args(&req.wants, &req.haves, req.deepen, &req.shallow);
+            let body = v2_request("fetch", &[], &args);
+            match &self.http {
+                Some(base) => {
+                    let resp = transport::http_authed(
+                        self.local.as_deref(),
+                        "POST",
+                        &format!("{}/git-upload-pack", base),
+                        &[
+                            ("Content-Type", "application/x-git-upload-pack-request"),
+                            ("Git-Protocol", "version=2"),
+                        ],
+                        Some(&body),
+                    )?;
+                    let mut cur: &[u8] = &resp.body;
+                    let (pack, shallow, unshallow) =
+                        read_v2_fetch_response(&mut cur, quiet)?;
+                    Ok(FetchResponse { pack, shallow, unshallow })
+                }
+                None => {
+                    let conn = self.conn.as_mut().ok_or_else(|| {
+                        GitError::Protocol("session closed".into())
+                    })?;
+                    conn.write_all(&body)?;
+                    conn.flush()?;
+                    let (pack, shallow, unshallow) =
+                        read_v2_fetch_response(conn, quiet)?;
+                    Ok(FetchResponse { pack, shallow, unshallow })
+                }
+            }
+        } else {
+            let body = build_fetch_request(req, &self.ad.caps);
+            match &self.http {
+                Some(base) => {
+                    let resp = transport::http_authed(
+                        self.local.as_deref(),
+                        "POST",
+                        &format!("{}/git-upload-pack", base),
+                        &[
+                            ("Content-Type", "application/x-git-upload-pack-request"),
+                            ("Accept", "application/x-git-upload-pack-result"),
+                        ],
+                        Some(&body),
+                    )?;
+                    if resp.status != 200 {
+                        return Err(GitError::Protocol(format!(
+                            "HTTP {} on upload-pack",
+                            resp.status
+                        )));
+                    }
+                    let side_band = self.ad.caps.contains("side-band-64k")
+                        || self.ad.caps.contains("side-band");
+                    let mut cur: &[u8] = &resp.body;
+                    read_fetch_response(&mut cur, side_band, quiet)
+                }
+                None => {
+                    let conn = self.conn.as_mut().ok_or_else(|| {
+                        GitError::Protocol("session closed".into())
+                    })?;
+                    conn.write_all(&body)?;
+                    conn.flush()?;
+                    let side_band = self.ad.caps.contains("side-band-64k")
+                        || self.ad.caps.contains("side-band");
+                    read_fetch_response(conn, side_band, quiet)
+                }
+            }
+        }
+    }
+
+    /// Run an additional ls-refs (v2 only; v0 reuses the advertisement).
+    pub fn ls_refs(&mut self, prefixes: &[&str]) -> Result<Advertisement> {
+        if !self.v2 {
+            return Ok(Advertisement::default());
+        }
+        let body = v2_request("ls-refs", &[], &ls_refs_args(prefixes));
+        let mut ad = Advertisement::default();
+        match &self.http {
+            Some(base) => {
+                let resp = transport::http_authed(
+                    self.local.as_deref(),
+                    "POST",
+                    &format!("{}/git-upload-pack", base),
+                    &[
+                        ("Content-Type", "application/x-git-upload-pack-request"),
+                        ("Git-Protocol", "version=2"),
+                    ],
+                    Some(&body),
+                )?;
+                let mut cur: &[u8] = &resp.body;
+                read_ls_refs(&mut cur, &mut ad)?;
+            }
+            None => {
+                let conn = self
+                    .conn
+                    .as_mut()
+                    .ok_or_else(|| GitError::Protocol("session closed".into()))?;
+                conn.write_all(&body)?;
+                conn.flush()?;
+                read_ls_refs(conn, &mut ad)?;
+            }
+        }
+        Ok(ad)
+    }
+
+    pub fn finish(&mut self) -> Result<()> {
+        if let Some(c) = &mut self.conn {
+            c.finish()?;
+        }
+        Ok(())
+    }
+
+    /// Whether the session negotiated protocol v2.
+    #[allow(dead_code)]
+    pub fn is_v2(&self) -> bool {
+        self.v2
+    }
+}
+
+/// True when the environment allows protocol v2 (GIT_PROTOCOL may pin v0).
+pub fn prefer_v2() -> bool {
+    match std::env::var("GIT_PROTOCOL") {
+        Ok(v) => !(v == "0" || v.eq_ignore_ascii_case("version=0")),
+        Err(_) => true,
+    }
+}
+
+/// Open a fetch session: probe for v2 (unless pinned off), falling back
+/// to v0 transparently. For v2 the advertisement comes from an ls-refs.
+pub fn open_fetch_session(
     url: &Url,
-    wants: &[Oid],
-    haves: &[Oid],
-    quiet: bool,
-) -> Result<(Vec<u8>, Advertisement)> {
-    let req = FetchRequest {
-        wants: wants.to_vec(),
-        haves: haves.to_vec(),
-    };
+    local: Option<&std::path::Path>,
+) -> Result<FetchSession> {
     match url {
         Url::Http { url } => {
             let base = url.trim_end_matches('/');
-            let ad = http_advertisement(base, "git-upload-pack")?;
-            let body = build_fetch_request(&req, &ad.caps);
-            let resp = transport::http_post(
-                &format!("{}/git-upload-pack", base),
-                "application/x-git-upload-pack-request",
-                "application/x-git-upload-pack-result",
-                &body,
-            )?;
-            if resp.status != 200 {
-                return Err(GitError::Protocol(format!(
-                    "HTTP {} on upload-pack",
-                    resp.status
-                )));
+            if prefer_v2() {
+                let resp = transport::http_authed(
+                    local,
+                    "GET",
+                    &format!("{}/info/refs?service=git-upload-pack", base),
+                    &[("Git-Protocol", "version=2")],
+                    None,
+                )?;
+                let mut cur: &[u8] = &resp.body;
+                if let Ok(Some(l)) = pktline::read(&mut cur) {
+                    if String::from_utf8_lossy(&l).trim_end() == "version 2" {
+                        // drain remaining caps, then ls-refs for the ad
+                        while let Ok(Some(_)) = pktline::read(&mut cur) {}
+                        let body =
+                            v2_request("ls-refs", &[], &ls_refs_args(&["HEAD", "refs/"]));
+                        let r2 = transport::http_authed(
+                            local,
+                            "POST",
+                            &format!("{}/git-upload-pack", base),
+                            &[
+                                ("Content-Type", "application/x-git-upload-pack-request"),
+                                ("Git-Protocol", "version=2"),
+                            ],
+                            Some(&body),
+                        )?;
+                        let mut ad = Advertisement::default();
+                        let mut cur2: &[u8] = &r2.body;
+                        read_ls_refs(&mut cur2, &mut ad)?;
+                        return Ok(FetchSession {
+                            ad,
+                            v2: true,
+                            http: Some(base.to_string()),
+                            conn: None,
+                            local: local.map(|p| p.to_path_buf()),
+                        });
+                    }
+                }
             }
-            let side_band = ad.caps.contains("side-band-64k") || ad.caps.contains("side-band");
-            let mut cursor: &[u8] = &resp.body;
-            let pack = read_fetch_response(&mut cursor, side_band, quiet)?;
-            Ok((pack, ad))
+            let ad = http_advertisement(local, base, "git-upload-pack")?;
+            Ok(FetchSession {
+                ad,
+                v2: false,
+                http: Some(base.to_string()),
+                conn: None,
+                local: local.map(|p| p.to_path_buf()),
+            })
         }
         _ => {
-            let (mut conn, ad) = open_fetch_conn(url)?;
-            let body = build_fetch_request(&req, &ad.caps);
-            conn.write_all(&body)?;
-            conn.flush()?;
-            let side_band = ad.caps.contains("side-band-64k") || ad.caps.contains("side-band");
-            let pack = read_fetch_response(&mut conn, side_band, quiet)?;
-            conn.finish()?;
-            Ok((pack, ad))
+            let conn = transport::connect_v2(url, "git-upload-pack")?;
+            let mut pc = transport::PeekConn::new(conn);
+            let line = pc
+                .read_pkt()?
+                .ok_or_else(|| GitError::Protocol("empty advertisement".into()))?;
+            let s = String::from_utf8_lossy(&line).trim_end().to_string();
+            let mut conn = Conn::Peek(Box::new(pc));
+            if prefer_v2() && s == "version 2" {
+                // drain capability lines
+                while let Some(_) = pktline::read(&mut conn)? {}
+                let mut session = FetchSession {
+                    ad: Advertisement::default(),
+                    v2: true,
+                    http: None,
+                    conn: Some(conn),
+                    local: local.map(|p| p.to_path_buf()),
+                };
+                session.ad = session.ls_refs(&["HEAD", "refs/"])?;
+                Ok(session)
+            } else {
+                let ad = parse_advertisement_with_first(&mut conn, line)?;
+                Ok(FetchSession {
+                    ad,
+                    v2: false,
+                    http: None,
+                    conn: Some(conn),
+                    local: local.map(|p| p.to_path_buf()),
+                })
+            }
         }
     }
 }
@@ -527,21 +769,26 @@ pub fn push(
     url: &Url,
     updates: &[(String, Oid, Oid)],
     pack_bytes: &[u8],
+    local: Option<&std::path::Path>,
     quiet: bool,
 ) -> Result<(String, Vec<(String, bool, String)>)> {
     match url {
         Url::Http { url } => {
             let base = url.trim_end_matches('/');
-            let ad = http_advertisement(base, "git-receive-pack")?;
+            let ad = http_advertisement(local, base, "git-receive-pack")?;
             let mut body = build_push_request(updates, &ad.caps)?;
             if !pack_bytes.is_empty() {
                 body.extend_from_slice(pack_bytes);
             }
-            let resp = transport::http_post(
+            let resp = transport::http_authed(
+                local,
+                "POST",
                 &format!("{}/git-receive-pack", base),
-                "application/x-git-receive-pack-request",
-                "application/x-git-receive-pack-result",
-                &body,
+                &[
+                    ("Content-Type", "application/x-git-receive-pack-request"),
+                    ("Accept", "application/x-git-receive-pack-result"),
+                ],
+                Some(&body),
             )?;
             if resp.status != 200 {
                 return Err(GitError::Protocol(format!(
@@ -603,7 +850,9 @@ pub fn build_pack_for_push(
             ObjType::Commit => {
                 let c = crate::object::Commit::parse(&obj.1)?;
                 stack.push(c.tree);
-                stack.extend(c.parents.iter().copied());
+                if !repo.is_shallow(&o) {
+                    stack.extend(c.parents.iter().copied());
+                }
             }
             ObjType::Tree => {
                 for e in crate::object::parse_tree(&obj.1)? {
@@ -633,10 +882,639 @@ pub fn build_pack_for_push(
             }
         }
     }
+    // The protocol requires a pack whenever any update has a non-zero
+    // new value — even when it contains zero objects. An empty vec here
+    // would deadlock a server waiting to parse PACK data.
+    Ok(crate::pack::write_pack(&ordered))
+}
+
+// ============================== protocol v2 ==============================
+
+/// The v2 capability advertisement (sent by the server before any command).
+const V2_CAPS: &[&str] = &[
+    "version 2",
+    "agent=qel/0.1",
+    "ls-refs=unborn",
+    "fetch=shallow wait-for-done",
+    "server-option",
+    "object-format=sha1",
+    "object-info",
+];
+
+/// Read the v2 capability advertisement (first pkt must be "version 2").
+/// Returns the capability lines.
+#[allow(dead_code)]
+pub fn read_v2_caps(r: &mut dyn Read) -> Result<Vec<String>> {
+    let mut caps = Vec::new();
+    let mut first = true;
+    loop {
+        let line = match pktline::read(r)? {
+            None => break,
+            Some(l) => l,
+        };
+        let s = String::from_utf8_lossy(&line).trim_end().to_string();
+        if first {
+            first = false;
+            if s != "version 2" {
+                return Err(GitError::Protocol(format!(
+                    "not a protocol-v2 server: {}",
+                    &s[..s.len().min(80)]
+                )));
+            }
+        }
+        caps.push(s);
+    }
+    Ok(caps)
+}
+
+/// Build a v2 command request: command + caps (one per pkt-line) +
+/// delim + args + flush.
+fn v2_request(command: &str, caps: &[&str], args: &[String]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&pktline::encode_str(&format!("command={}\n", command)));
+    out.extend_from_slice(&pktline::encode_str("agent=qel/0.1\n"));
+    out.extend_from_slice(&pktline::encode_str("object-format=sha1\n"));
+    for c in caps {
+        out.extend_from_slice(&pktline::encode_str(&format!("{}\n", c)));
+    }
+    out.extend_from_slice(pktline::DELIM);
+    for a in args {
+        out.extend_from_slice(&pktline::encode_str(&format!("{}\n", a)));
+    }
+    out.extend_from_slice(pktline::FLUSH);
+    out
+}
+
+/// Parse one v2 ref line: "<oid> <refname>[ symref-target:<t>][ peeled:<o>]"
+/// or "unborn <refname> symref-target:<t>".
+fn parse_v2_ref(
+    s: &str,
+    ad: &mut Advertisement,
+) {
+    let mut it = s.split(' ');
+    let first = it.next().unwrap_or("");
+    if first == "unborn" {
+        if let Some(name) = it.next() {
+            if name == "HEAD" {
+                if let Some(t) = it.find_map(|p| p.strip_prefix("symref-target:")) {
+                    ad.head_target = Some(t.to_string());
+                }
+            }
+        }
+        return;
+    }
+    let (Ok(oid), Some(name)) = (Oid::from_hex(first), it.next()) else {
+        return;
+    };
+    let name = name.to_string();
+    for attr in it {
+        if let Some(t) = attr.strip_prefix("symref-target:") {
+            ad.symrefs.push((name.clone(), t.to_string()));
+        } else if let Some(p) = attr.strip_prefix("peeled:") {
+            if let Ok(po) = Oid::from_hex(p) {
+                ad.peeled.insert(name.clone(), po);
+            }
+        }
+    }
+    if name == "HEAD" {
+        ad.head_oid = Some(oid);
+    }
+    ad.refs.push((name, oid));
+}
+
+/// Read an ls-refs response into an Advertisement.
+fn read_ls_refs(r: &mut dyn Read, ad: &mut Advertisement) -> Result<()> {
+    while let Some(line) = pktline::read(r)? {
+        let s = String::from_utf8_lossy(&line).trim_end().to_string();
+        parse_v2_ref(&s, ad);
+    }
+    for (a, b) in &ad.symrefs {
+        if a == "HEAD" {
+            ad.head_target = Some(b.clone());
+        }
+    }
+    Ok(())
+}
+
+/// Build the ls-refs command args.
+fn ls_refs_args(prefixes: &[&str]) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "peel".into(),
+        "symrefs".into(),
+        "unborn".into(),
+    ];
+    for p in prefixes {
+        args.push(format!("ref-prefix {}", p));
+    }
+    args
+}
+
+/// Build the fetch command args (v2).
+fn fetch_v2_args(wants: &[Oid], haves: &[Oid], deepen: Option<u32>, shallow: &[Oid]) -> Vec<String> {
+    let mut args = vec![
+        "thin-pack".to_string(),
+        "no-progress".to_string(),
+        "ofs-delta".to_string(),
+        // required for the trailing "done" line to be legal
+        "wait-for-done".to_string(),
+    ];
+    if let Some(d) = deepen {
+        args.push(format!("deepen {}", d));
+    }
+    for s in shallow {
+        args.push(format!("shallow {}", s.hex()));
+    }
+    for w in wants {
+        args.push(format!("want {}", w.hex()));
+    }
+    for h in haves {
+        args.push(format!("have {}", h.hex()));
+    }
+    args.push("done".to_string());
+    args
+}
+
+/// Read a v2 fetch response: sections are "acknowledgments" and "packfile".
+/// Returns (pack bytes, shallow oids, unshallow oids).
+pub fn read_v2_fetch_response(
+    r: &mut dyn Read,
+    quiet: bool,
+) -> Result<(Vec<u8>, Vec<Oid>, Vec<Oid>)> {
+    let mut pack = Vec::new();
+    let mut shallow = Vec::new();
+    let mut unshallow = Vec::new();
+    while let Some(line) = pktline::read(r)? {
+        if line == vec![1u8] {
+            continue; // section delimiter
+        }
+        if line.is_empty() {
+            continue;
+        }
+        let s = String::from_utf8_lossy(&line);
+        let t = s.trim_end();
+        if t == "packfile" || t == "acknowledgments" || t == "ready"
+            || t == "shallow-info" || t == "wanted-refs" || t == "packfile-uris"
+            || t.starts_with("ACK ") || t == "NAK"
+        {
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix("shallow ") {
+            if let Ok(o) = Oid::from_hex(rest) {
+                shallow.push(o);
+            }
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix("unshallow ") {
+            if let Ok(o) = Oid::from_hex(rest) {
+                unshallow.push(o);
+            }
+            continue;
+        }
+        // side-band packet
+        handle_band_packet(&line, &mut pack, quiet)?;
+    }
+    Ok((pack, shallow, unshallow))
+}
+
+
+// ============================== protocol v2 server ==============================
+
+/// Read one v2 command block: "command=<name>" + caps lines, `0001` delim,
+/// then args until flush. Ok(None) = end of session.
+fn read_v2_command(
+    r: &mut dyn Read,
+) -> Result<Option<(String, HashSet<String>, Vec<String>)>> {
+    let mut command: Option<String> = None;
+    let mut caps: HashSet<String> = HashSet::new();
+    let mut saw_delim = false;
+    loop {
+        match pktline::read(r)? {
+            None => {
+                return if command.is_some() {
+                    Ok(Some((command.unwrap(), caps, Vec::new())))
+                } else {
+                    Ok(None)
+                }
+            }
+            Some(l) if l == vec![1u8] => {
+                saw_delim = true;
+                break;
+            }
+            Some(l) if l == vec![2u8] => break,
+            Some(l) => {
+                let s = String::from_utf8_lossy(&l).trim_end().to_string();
+                if let Some(c) = s.strip_prefix("command=") {
+                    command = Some(c.to_string());
+                } else if let Some(kv) = s.split_once(' ') {
+                    caps.insert(kv.0.to_string());
+                } else {
+                    caps.insert(s);
+                }
+            }
+        }
+    }
+    let _ = saw_delim;
+    let mut args = Vec::new();
+    while let Some(l) = pktline::read(r)? {
+        if l == vec![1u8] || l == vec![2u8] {
+            continue;
+        }
+        args.push(String::from_utf8_lossy(&l).trim_end().to_string());
+    }
+    Ok(Some((
+        command.unwrap_or_default(),
+        caps,
+        args,
+    )))
+}
+
+/// The v2 capability advertisement alone (stateless `--advertise-refs`).
+pub fn advertise_refs_v2(w: &mut dyn Write) -> Result<()> {
+    for c in V2_CAPS {
+        w.write_all(&pktline::encode_str(&format!("{}\n", c)))?;
+    }
+    w.write_all(pktline::FLUSH)?;
+    w.flush()?;
+    Ok(())
+}
+
+/// Stateless v2 (HTTP): one command block per invocation.
+pub fn serve_upload_pack_stateless_v2(
+    repo: &Repo,
+    r: &mut dyn Read,
+    w: &mut dyn Write,
+) -> Result<()> {
+    if let Some(cmd) = read_v2_command(r)? {
+        match cmd.0.as_str() {
+            "ls-refs" => serve_v2_ls_refs(repo, &cmd.2, w)?,
+            "fetch" => serve_v2_fetch(repo, &cmd.2, w)?,
+            "object-info" => serve_v2_object_info(repo, &cmd.2, w)?,
+            other => {
+                w.write_all(&pktline::encode_str(&format!(
+                    "ERR unsupported command: {}\n",
+                    other
+                )))?;
+            }
+        }
+    }
+    w.flush()?;
+    Ok(())
+}
+
+/// Serve a protocol-v2 upload-pack session (capability advertisement then
+/// ls-refs/fetch/object-info commands until EOF).
+pub fn serve_upload_pack_v2(repo: &Repo, r: &mut dyn Read, w: &mut dyn Write) -> Result<()> {
+    for c in V2_CAPS {
+        w.write_all(&pktline::encode_str(&format!("{}\n", c)))?;
+    }
+    w.write_all(pktline::FLUSH)?;
+    w.flush()?;
+    loop {
+        let cmd = match read_v2_command(r)? {
+            None => return Ok(()),
+            Some(c) => c,
+        };
+        match cmd.0.as_str() {
+            "ls-refs" => serve_v2_ls_refs(repo, &cmd.2, w)?,
+            "fetch" => serve_v2_fetch(repo, &cmd.2, w)?,
+            "object-info" => serve_v2_object_info(repo, &cmd.2, w)?,
+            other => {
+                w.write_all(&pktline::encode_str(&format!(
+                    "ERR unsupported command: {}\n",
+                    other
+                )))?;
+                w.flush()?;
+            }
+        }
+        w.flush()?;
+    }
+}
+
+fn serve_v2_ls_refs(repo: &Repo, args: &[String], w: &mut dyn Write) -> Result<()> {
+    let mut peel = false;
+    let mut symrefs = false;
+    let mut unborn = false;
+    let mut prefixes: Vec<String> = Vec::new();
+    for a in args {
+        match a.as_str() {
+            "peel" => peel = true,
+            "symrefs" => symrefs = true,
+            "unborn" => unborn = true,
+            _ => {
+                if let Some(p) = a.strip_prefix("ref-prefix ") {
+                    prefixes.push(p.to_string());
+                }
+            }
+        }
+    }
+    let head_oid = repo.head_oid()?;
+    let head_branch = repo.current_branch();
+    let head_matches = prefixes.is_empty() || prefixes.iter().any(|p| "HEAD".starts_with(p.as_str()));
+    let mut wrote = false;
+    if head_matches {
+        if let Some(h) = head_oid {
+            let mut line = format!("{} HEAD", h.hex());
+            if symrefs {
+                if let Some(b) = &head_branch {
+                    line.push_str(&format!(" symref-target:refs/heads/{}", b));
+                }
+            }
+            w.write_all(&pktline::encode_str(&format!("{}\n", line)))?;
+            wrote = true;
+        } else if unborn {
+            let target = head_branch
+                .map(|b| format!(" symref-target:refs/heads/{}", b))
+                .unwrap_or_default();
+            w.write_all(&pktline::encode_str(&format!("unborn HEAD{}\n", target)))?;
+            wrote = true;
+        }
+    }
+    for (name, oid) in repo.list_refs("refs/")? {
+        if !prefixes.is_empty() && !prefixes.iter().any(|p| name.starts_with(p.as_str())) {
+            continue;
+        }
+        let mut line = format!("{} {}", oid.hex(), name);
+        if peel {
+            if let Ok(o) = repo.odb.read(&oid) {
+                if o.0 == ObjType::Tag {
+                    if let Ok(p) = crate::refs::peel_to_non_tag(repo, &oid) {
+                        if p != oid {
+                            line.push_str(&format!(" peeled:{}", p.hex()));
+                        }
+                    }
+                }
+            }
+        }
+        w.write_all(&pktline::encode_str(&format!("{}\n", line)))?;
+        wrote = true;
+    }
+    let _ = wrote;
+    w.write_all(pktline::FLUSH)?;
+    Ok(())
+}
+
+/// Compute the shallow boundary for a --depth fetch: the commit oids at
+/// exactly `depth` steps from each want tip.
+pub fn shallow_boundary(repo: &Repo, wants: &[Oid], depth: u32) -> Result<Vec<Oid>> {
+    let mut boundary = Vec::new();
+    let mut seen: HashSet<Oid> = HashSet::new();
+    // BFS by commit-depth
+    let mut level: Vec<Oid> = wants.to_vec();
+    let mut d = 0u32;
+    while !level.is_empty() {
+        let mut next = Vec::new();
+        for oid in &level {
+            if !seen.insert(*oid) {
+                continue;
+            }
+            if d + 1 >= depth {
+                boundary.push(*oid);
+                continue;
+            }
+            if let Ok(c) = crate::revwalk::load_commit(repo, oid) {
+                next.extend(c.parents.iter().copied());
+            }
+        }
+        if !next.is_empty() && d + 1 < depth {
+            d += 1;
+            level = next;
+        } else {
+            break;
+        }
+    }
+    Ok(boundary)
+}
+
+/// Objects for a depth-limited pack: closure of wants truncated at `depth`.
+fn build_pack_shallow(repo: &Repo, wants: &[Oid], remote_tips: &[Oid], depth: u32) -> Result<Vec<u8>> {
+    // commits within depth (inclusive)
+    let mut included: HashSet<Oid> = HashSet::new();
+    let mut level: Vec<Oid> = wants.to_vec();
+    let mut d = 0u32;
+    while !level.is_empty() && d < depth {
+        let mut next = Vec::new();
+        for oid in &level {
+            if !included.insert(*oid) {
+                continue;
+            }
+            if let Ok(c) = crate::revwalk::load_commit(repo, oid) {
+                next.extend(c.parents.iter().copied());
+            }
+        }
+        d += 1;
+        level = next;
+    }
+    // excluded tips = remote_tips + parents of boundary commits
+    let mut remote_have: HashSet<Oid> = HashSet::new();
+    for t in remote_tips {
+        for o in crate::revwalk::reachable_objects(repo, &[*t])? {
+            remote_have.insert(o);
+        }
+    }
+    let mut need: HashSet<Oid> = HashSet::new();
+    let mut stack: Vec<Oid> = Vec::new();
+    for oid in &included {
+        if let Ok(c) = crate::revwalk::load_commit(repo, oid) {
+            stack.push(*oid);
+            stack.push(c.tree);
+        }
+    }
+    for w in wants {
+        if let Ok(obj) = repo.odb.read(w) {
+            if obj.0 == ObjType::Tag {
+                stack.push(*w);
+            }
+        }
+    }
+    while let Some(o) = stack.pop() {
+        if remote_have.contains(&o) || !need.insert(o) {
+            continue;
+        }
+        let obj = match repo.odb.read_opt(&o)? {
+            Some(x) => x,
+            None => continue,
+        };
+        match obj.0 {
+            ObjType::Commit => {
+                let c = crate::object::Commit::parse(&obj.1)?;
+                stack.push(c.tree);
+                // parents deliberately NOT followed when shallow
+                if !included.contains(&o) {
+                    stack.extend(c.parents.iter().copied());
+                }
+            }
+            ObjType::Tree => {
+                for e in crate::object::parse_tree(&obj.1)? {
+                    stack.push(e.oid);
+                }
+            }
+            ObjType::Tag => {
+                let t = crate::object::Tag::parse(&obj.1)?;
+                stack.push(t.object);
+            }
+            ObjType::Blob => {}
+        }
+    }
+    let mut ordered = Vec::new();
+    let mut sorted: Vec<Oid> = need.into_iter().collect();
+    sorted.sort();
+    for ty in [ObjType::Commit, ObjType::Tree, ObjType::Blob, ObjType::Tag] {
+        for o in &sorted {
+            let obj = repo.odb.read(o)?;
+            if obj.0 == ty {
+                ordered.push(PackObj { oid: *o, ty, data: obj.1.clone() });
+            }
+        }
+    }
     if ordered.is_empty() {
         return Ok(Vec::new());
     }
     Ok(crate::pack::write_pack(&ordered))
+}
+
+fn serve_v2_fetch(repo: &Repo, args: &[String], w: &mut dyn Write) -> Result<()> {
+    let mut wants = Vec::new();
+    let mut haves = Vec::new();
+    let mut deepen: Option<u32> = None;
+    let mut client_shallow: Vec<Oid> = Vec::new();
+    let mut sideband_all = false;
+    for a in args {
+        if a == "sideband-all" || a == "side-band-all" {
+            sideband_all = true;
+        } else if let Some(s) = a.strip_prefix("want ") {
+            if let Ok(o) = Oid::from_hex(s) {
+                wants.push(o);
+            }
+        } else if let Some(s) = a.strip_prefix("have ") {
+            if let Ok(o) = Oid::from_hex(s) {
+                haves.push(o);
+            }
+        } else if let Some(s) = a.strip_prefix("deepen ") {
+            deepen = s.parse().ok();
+        } else if let Some(s) = a.strip_prefix("shallow ") {
+            if let Ok(o) = Oid::from_hex(s) {
+                client_shallow.push(o);
+            }
+        }
+    }
+    let mut shallow_lines: Vec<Oid> = Vec::new();
+    if let Some(d) = deepen {
+        shallow_lines = shallow_boundary(repo, &wants, d)?;
+    }
+    let _ = client_shallow;
+    // acknowledgments (only when the client sent haves)
+    let haves_known: Vec<Oid> = haves
+        .iter()
+        .copied()
+        .filter(|o| repo.odb.has(o))
+        .collect();
+    if !haves.is_empty() {
+        w.write_all(&pktline::encode_str("acknowledgments\n"))?;
+        for o in &haves_known {
+            w.write_all(&pktline::encode_str(&format!("ACK {}\n", o.hex())))?;
+        }
+        w.write_all(&pktline::encode_str("ready\n"))?;
+        w.write_all(b"0001")?;
+    }
+    if !shallow_lines.is_empty() {
+        w.write_all(&pktline::encode_str("shallow-info\n"))?;
+        for o in &shallow_lines {
+            w.write_all(&pktline::encode_str(&format!("shallow {}\n", o.hex())))?;
+        }
+        w.write_all(b"0001")?;
+    }
+    let remote_tips: &[Oid] = if haves_known.is_empty() { &[] } else { &haves_known };
+    let pack = match deepen {
+        Some(d) => build_pack_shallow(repo, &wants, remote_tips, d)?,
+        None => build_pack_for_push(repo, &wants, remote_tips)?,
+    };
+    w.write_all(&pktline::encode_str("packfile\n"))?;
+    let _ = sideband_all; // packfile content is band-1 either way in v2
+    write_band1(w, &pack)?;
+    Ok(())
+}
+
+fn serve_v2_object_info(repo: &Repo, args: &[String], w: &mut dyn Write) -> Result<()> {
+    let mut want_size = false;
+    let mut oids = Vec::new();
+    for a in args {
+        if a == "size" {
+            want_size = true;
+        } else if let Some(s) = a.strip_prefix("oid ") {
+            if let Ok(o) = Oid::from_hex(s) {
+                oids.push(o);
+            }
+        }
+    }
+    w.write_all(&pktline::encode_str("object-info\n"))?;
+    for o in &oids {
+        if let Ok(Some(obj)) = repo.odb.read_opt(o) {
+            if want_size {
+                w.write_all(&pktline::encode_str(&format!(
+                    "{} {}\n",
+                    o.hex(),
+                    obj.1.len()
+                )))?;
+            } else {
+                w.write_all(&pktline::encode_str(&format!("{}\n", o.hex())))?;
+            }
+        }
+    }
+    w.write_all(pktline::FLUSH)?;
+    Ok(())
+}
+
+/// Parse a v0 advertisement whose first line was already consumed.
+fn parse_advertisement_with_first(
+    r: &mut dyn Read,
+    first_line: Vec<u8>,
+) -> Result<Advertisement> {
+    let mut ad = Advertisement::default();
+    // reuse the main parser logic for the first line
+    let text = String::from_utf8_lossy(&first_line);
+    let text = text.strip_suffix('\n').unwrap_or(&text);
+    let (payload, _) = match text.split_once('\0') {
+        Some((p, c)) => {
+            for cap in c.split(' ') {
+                let cap = cap.trim();
+                if cap.is_empty() {
+                    continue;
+                }
+                if let Some(sr) = cap.strip_prefix("symref=") {
+                    if let Some((a, b)) = sr.split_once(':') {
+                        ad.symrefs.push((a.to_string(), b.to_string()));
+                    }
+                } else {
+                    ad.caps.insert(cap.to_string());
+                }
+            }
+            (p, true)
+        }
+        None => (text, true),
+    };
+    if let Some((sha, name)) = payload.split_once(' ') {
+        if let Ok(oid) = Oid::from_hex(sha) {
+            let name = name.trim();
+            if name == "HEAD" {
+                ad.head_oid = Some(oid);
+            }
+            ad.refs.push((name.to_string(), oid));
+        }
+    }
+    // rest of the lines via the normal parser
+    let rest = parse_advertisement(r)?;
+    ad.refs.extend(rest.refs);
+    ad.peeled.extend(rest.peeled);
+    ad.caps.extend(rest.caps);
+    ad.symrefs.extend(rest.symrefs);
+    ad.shallow.extend(rest.shallow);
+    ad.head_oid = ad.head_oid.or(rest.head_oid);
+    for (a, b) in &ad.symrefs {
+        if a == "HEAD" {
+            ad.head_target = Some(b.clone());
+        }
+    }
+    Ok(ad)
 }
 
 // ============================== server side ==============================
@@ -649,6 +1527,7 @@ const SERVER_CAPS_UPLOAD: &[&str] = &[
     "ofs-delta",
     "no-progress",
     "include-tag",
+    "shallow",
     "object-format=sha1",
     "agent=qel/0.1",
 ];
@@ -881,6 +1760,8 @@ pub fn serve_upload_pack_stateless(repo: &Repo, r: &mut dyn Read, w: &mut dyn Wr
     // wants
     let mut wants: Vec<Oid> = Vec::new();
     let mut client_caps: HashSet<String> = HashSet::new();
+    let mut deepen: Option<u32> = None;
+    let mut client_shallow: Vec<Oid> = Vec::new();
     loop {
         let line = match pktline::read(r)? {
             None => break,
@@ -902,10 +1783,20 @@ pub fn serve_upload_pack_stateless(repo: &Repo, r: &mut dyn Read, w: &mut dyn Wr
             if let Ok(o) = Oid::from_hex(sha) {
                 wants.push(o);
             }
-        } else if s == "deepen" || s.starts_with("deepen ") || s == "shallow" {
-            // shallow requests unsupported — error like git without the feature
+        } else if let Some(d) = s.strip_prefix("deepen ") {
+            deepen = d.trim().parse().ok();
+            if deepen.is_none() {
+                return Err(GitError::Protocol("invalid deepen".into()));
+            }
+        } else if let Some(sha) = s.strip_prefix("shallow ") {
+            if let Ok(o) = Oid::from_hex(sha) {
+                client_shallow.push(o);
+            }
+        } else if s == "deepen" || s.starts_with("deepen-since")
+            || s.starts_with("deepen-not") || s == "unshallow"
+        {
             return Err(GitError::Protocol(
-                "shallow clones not supported".into(),
+                "unsupported shallow option".into(),
             ));
         }
     }
@@ -949,6 +1840,21 @@ pub fn serve_upload_pack_stateless(repo: &Repo, r: &mut dyn Read, w: &mut dyn Wr
             w.write_all(&pktline::encode_str("NAK\n"))?;
         }
     }
+    // shallow boundary report (v0): emitted before the pack when the
+    // client requested a depth limit
+    if let Some(d) = deepen {
+        let shallow_lines = shallow_boundary(repo, &wants, d)?;
+        for o in &shallow_lines {
+            w.write_all(&pktline::encode_str(&format!("shallow {}\n", o.hex())))?;
+        }
+        // boundary commits the client already has become unshallow when
+        // we now cover their parents
+        for o in &client_shallow {
+            if repo.odb.has(o) && !shallow_lines.contains(o) {
+                w.write_all(&pktline::encode_str(&format!("unshallow {}\n", o.hex())))?;
+            }
+        }
+    }
     // if we couldn't ACK, the pack must be the full closure of wants —
     // excluding client haves is only legal after an ACK.
     let remote_tips: &[Oid] = if last_common.is_some() && can_ack {
@@ -956,7 +1862,10 @@ pub fn serve_upload_pack_stateless(repo: &Repo, r: &mut dyn Read, w: &mut dyn Wr
     } else {
         &[]
     };
-    let pack = build_pack_for_push(repo, &wants, remote_tips)?;
+    let pack = match deepen {
+        Some(d) => build_pack_shallow(repo, &wants, remote_tips, d)?,
+        None => build_pack_for_push(repo, &wants, remote_tips)?,
+    };
     if client_caps.contains("side-band-64k") {
         if pack.is_empty() {
             w.write_all(pktline::FLUSH)?;
@@ -1018,7 +1927,7 @@ pub fn serve_receive_pack_stateless(
         return Ok(());
     }
     let side_band = client_caps.contains("side-band-64k");
-    let report_v2 = client_caps.contains("report-status-v2");
+    let _report_v2 = client_caps.contains("report-status-v2");
 
     // A pack follows iff some command has a non-zero new value —
     // delete-only pushes send no pack (the socket stays open for our

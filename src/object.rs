@@ -241,6 +241,7 @@ impl Commit {
         s.into_bytes()
     }
 
+    #[allow(dead_code)]
     pub fn committer_time(&self) -> i64 {
         self.committer.time
     }
@@ -325,9 +326,11 @@ impl TreeEntry {
     pub fn is_gitlink(&self) -> bool {
         self.mode == 0o160000
     }
+    #[allow(dead_code)]
     pub fn is_symlink(&self) -> bool {
         self.mode & 0o170000 == 0o120000
     }
+    #[allow(dead_code)]
     pub fn mode_str(&self) -> String {
         format!("{:o}", self.mode)
     }

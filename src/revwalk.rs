@@ -8,7 +8,14 @@ use std::collections::{HashMap, HashSet};
 pub fn load_commit(repo: &Repo, oid: &Oid) -> Result<Commit> {
     let obj = repo.odb.read(oid)?;
     match obj.0 {
-        ObjType::Commit => Commit::parse(&obj.1),
+        ObjType::Commit => {
+            let mut c = Commit::parse(&obj.1)?;
+            // shallow boundary: graft the commit to have no parents
+            if repo.is_shallow(oid) {
+                c.parents.clear();
+            }
+            Ok(c)
+        }
         ObjType::Tag => {
             let tag = crate::object::Tag::parse(&obj.1)?;
             load_commit(repo, &tag.object)
@@ -27,7 +34,13 @@ pub fn rev_list(repo: &Repo, tips: &[Oid]) -> Result<Vec<Oid>> {
             None => return Ok(None),
         };
         match obj.0 {
-            ObjType::Commit => Ok(Some(Commit::parse(&obj.1)?)),
+            ObjType::Commit => {
+                let mut c = Commit::parse(&obj.1)?;
+                if repo.is_shallow(o) {
+                    c.parents.clear();
+                }
+                Ok(Some(c))
+            }
             ObjType::Tag => {
                 let t = crate::object::Tag::parse(&obj.1)?;
                 load(repo, &t.object)
@@ -38,7 +51,7 @@ pub fn rev_list(repo: &Repo, tips: &[Oid]) -> Result<Vec<Oid>> {
     // sorted list, newest (largest committer time) at the front
     let mut list: std::collections::VecDeque<(Oid, Commit)> = Default::default();
     let mut seen: HashSet<Oid> = HashSet::new();
-    let mut insert_by_date =
+    let insert_by_date =
         |list: &mut std::collections::VecDeque<(Oid, Commit)>, o: Oid, c: Commit| {
             // insert before the first entry strictly older than `c`
             let pos = list
@@ -69,6 +82,7 @@ pub fn rev_list(repo: &Repo, tips: &[Oid]) -> Result<Vec<Oid>> {
 }
 
 /// Set of all commits reachable from `tip` (for is_ancestor etc).
+#[allow(dead_code)]
 pub fn reachable_set(repo: &Repo, tip: &Oid) -> Result<HashSet<Oid>> {
     Ok(rev_list(repo, &[*tip])?.into_iter().collect())
 }
@@ -88,7 +102,10 @@ pub fn reachable_objects(repo: &Repo, tips: &[Oid]) -> Result<HashSet<Oid>> {
         };
         match obj.0 {
             ObjType::Commit => {
-                let c = Commit::parse(&obj.1)?;
+                let mut c = Commit::parse(&obj.1)?;
+                if repo.is_shallow(&o) {
+                    c.parents.clear();
+                }
                 stack.push(c.tree);
                 stack.extend(c.parents.iter().copied());
             }
@@ -217,6 +234,9 @@ pub fn is_ancestor_of(repo: &Repo, a: &Oid, b: &Oid) -> Result<bool> {
             continue;
         }
         let c = Commit::parse(&obj.1)?;
+        if repo.is_shallow(&o) {
+            continue;
+        }
         queue.extend(c.parents.iter().copied());
     }
     Ok(false)

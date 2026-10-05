@@ -13,11 +13,13 @@ Compatibility note: ⚠ marks behavior that intentionally differs from git
 Create a repository (default branch `master`, like git <2.30; pass `-b main`
 for modern naming).
 
-### `qel clone [--bare|--mirror] [-q] [-o <name>] [-b <branch>] <src> [<dir>]`
+### `qel clone [--bare|--mirror] [-q] [-o <name>] [-b <branch>] [--depth <n>] <src> [<dir>]`
 Clone from a URL (`git://`, `ssh://`, `user@host:path`, `http(s)://`) or a
 local path. Local clones copy objects directly; remote clones run the full
-want/have protocol. Sets `origin` remote, remote-tracking refs, remote HEAD
-symref, and checks out the default branch.
+want/have protocol (v2 when the server supports it, v0 otherwise). Sets
+`origin` remote, remote-tracking refs, remote HEAD symref, and checks out
+the default branch. `--depth <n>` produces a real shallow clone
+(`.git/shallow` written; history truncated at the boundary).
 
 ## Working tree & index
 
@@ -77,30 +79,77 @@ index entries + `<<<<<<<` markers and set `MERGE_HEAD`; `--abort` restores.
 ### `qel merge-base <a> <b>` · `qel merge-file <cur> <base> <other> [-L x3]`
 ### `qel rev-list [--count] [--all] [--max-count=N] [--reverse] <rev>...`
 Supports `A..B`, `A...B`, `^A` exclusion syntax.
+### `qel rebase [--onto <o>] <upstream> [<branch>]` · `qel rebase --continue|--skip|--abort|--quit`
+Replays `<upstream>..<branch>` commits (non-merge, oldest first) onto
+`--onto`/`<upstream>` with the same 3-way machinery as cherry-pick;
+preserves authors and messages. Conflicts stop with a git-compatible
+`.git/rebase-merge` state dir — real `git status`/`git rebase --continue`
+understand it (and vice versa). `--continue` commits staged resolutions,
+`--skip` drops the stopped pick, `--abort` restores `ORIG_HEAD`.
 
 ## Remotes
 
-### `qel fetch [<remote>|<url> [<refspec>...]] [-q]`
-Negotiates wants/haves (multi_ack_detailed), stores the pack, updates
-remote-tracking refs + `FETCH_HEAD`.
+### `qel fetch [--depth <n>|--deepen <n>|--unshallow] [<remote>|<url> [<refspec>...]] [-q]`
+Negotiates wants/haves (multi_ack_detailed over v0, `fetch` command over
+v2), stores the pack, updates remote-tracking refs + `FETCH_HEAD`.
+`--depth`/`--deepen` adjust the shallow boundary; `--unshallow` completes
+the history and removes `.git/shallow`.
 ### `qel pull` = fetch + merge `FETCH_HEAD`.
 ### `qel push [-f|--force] [-u|--set-upstream] [-d|--delete] [--tags|--all] [<remote>|<url> [<refspec>...]]`
 Refuses non-fast-forward unless `+`/`--force`; sends only objects the
 server lacks; parses `report-status` (`ok`/`ng` per ref).
 ### `qel ls-remote [<remote>|<url>]` — advertisement dump.
 ### `qel remote [add|remove|set-url|get-url|show|-v]`
+### `qel credential <fill|approve|reject>` — the credential plumbing.
+Reads `key=value` pairs on stdin; `fill` consults configured
+`credential.helper`/`credential.<url>.helper` values (`get` op), `approve`
+runs `store`, `reject` runs `erase`. Helper forms per git docs:
+`!shell…`, shell fragments, absolute paths, and named `git credential-*`
+helpers. Used automatically for `http(s)://` fetches/pushes: credentials
+are filled before the first request and approved/rejected after; secrets
+are passed to `curl` via a temp netrc file, never on the command line.
 
 ## Serving repositories
 
 ### `qel upload-pack [--strict] [--stateless-rpc] [--advertise-refs] <dir>`
 Serve one fetch session on stdin/stdout — this is what a remote git invokes
-over SSH, or what a CGI calls for smart HTTP.
+over SSH, or what a CGI calls for smart HTTP. Speaks protocol v2 when the
+client offers `version=2` (`ls-refs`, `fetch`, `object-info`,
+`shallow-info`, `unborn`, `symref-target`, `peeled`).
 ### `qel receive-pack [--stateless-rpc] [--advertise-refs] <dir>`
 Serve one push session; validates updates, enforces `denyCurrentBranch`
 for non-bare repos, writes reflogs, answers `report-status`/`v2`.
 ### `qel daemon [--port=N] [--listen=A] [--base-path=P] [--export-all] [--enable=<svc>] [--disable=<svc>] [--enable-all] [<dir>...]`
 `git://` server. Upload-pack only by default (like git daemon); requires
-`git-daemon-export-ok` per repo unless `--export-all`.
+`git-daemon-export-ok` per repo unless `--export-all`. Negotiates
+protocol v2 per-connection from the `\0\0version=2\0` request probe.
+
+## Worktrees, bisect & submodules
+
+### `qel worktree list|add|remove|lock|unlock|prune`
+`add <path> [<commit-ish>]` creates the standard `$GIT_DIR/worktrees/<id>`
+admin dir + `.git` file — real `git worktree list`/`status` see it (and
+qel sees git-created worktrees). Refuses to check out a branch already
+checked out elsewhere (like git) unless `--force`. `remove` requires a
+clean worktree (`--force` overrides); `prune` drops admin dirs whose
+worktree vanished; `lock`/`unlock` manage the `locked` file.
+### `qel bisect start|bad|good|skip|reset|log|replay`
+Binary search. Marks live under `refs/bisect/<term>-<oid>` (the same
+layout `git bisect` writes, so `git for-each-ref` and even a mixed
+qel/git bisect session interoperate); `BISECT_TERMS`, `BISECT_START`,
+`BISECT_LOG` are git-format. Each mark detaches HEAD at a midpoint pick;
+when the first-bad commit is isolated it is reported with its commit
+info. `--term-good=X --term-bad=Y` rename the terms. `reset` restores
+the recorded head.
+### `qel submodule status|init|update|add`
+`status` output matches `git submodule status` (` `/`+`/`-` prefixes,
+recorded vs checked-out gitlink). `init` copies `.gitmodules` URLs into
+`submodule.<name>.url` config. `update [--init]` clones missing
+submodules (relative URLs resolve against the superproject's remote, or
+its own directory when there's no remote) and detaches HEAD at the
+gitlink commit. `add` clones, stages the gitlink, and appends
+`.gitmodules`. ⚠ `deinit`/`foreach`/`sync`/`summary`/`absorbgitdirs` are
+not implemented.
 
 ## Plumbing
 
@@ -122,6 +171,7 @@ for non-bare repos, writes reflogs, answers `report-status`/`v2`.
 | `index-pack [--stdin] <pack>` | store a pack + write idx |
 | `unpack-objects < <pack>` | inflate a pack to loose objects |
 | `pack-objects [--stdout] <base>` | build a pack from stdin oid list (full closure) |
+| `mktag` | read a tag object on stdin, validate, store, print oid |
 | `fsck [--strict]` | object-db integrity check |
 | `count-objects` | loose object count |
 | `pack-refs [--all]` | write packed-refs, prune loose |
@@ -130,7 +180,7 @@ for non-bare repos, writes reflogs, answers `report-status`/`v2`.
 | `var <name>` | `GIT_AUTHOR_IDENT`, `GIT_COMMITTER_IDENT`, `GIT_DEFAULT_BRANCH`, `GIT_EDITOR` |
 | `check-ignore [-v] <path>...` | ignore-rule diagnosis |
 | `config [--list] [--get] <key> [<value>]` | get/set/unset config |
-| `gc` | ⚠ no-op placeholder |
+| `gc` | repack all reachable objects into one pack, prune loose, pack refs. Reachability = refs + reflog entries (old *and* new columns) + index blobs |
 
 ## Exit codes
 

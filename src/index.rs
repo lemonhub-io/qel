@@ -44,6 +44,7 @@ impl IndexEntry {
 pub struct Index {
     pub entries: Vec<IndexEntry>,
     /// raw bytes of extensions we don't understand? we drop them (safe).
+    #[allow(dead_code)]
     pub version: u32,
 }
 
@@ -243,6 +244,7 @@ impl Index {
     }
 
     /// Remove all entries under `dir/` (for rm -r / checkout).
+    #[allow(dead_code)]
     pub fn remove_dir(&mut self, dir: &str) {
         let prefix = format!("{}/", dir.trim_end_matches('/'));
         self.entries.retain(|e| !e.path.starts_with(&prefix) && e.path != dir);

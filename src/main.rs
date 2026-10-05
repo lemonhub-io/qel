@@ -1,6 +1,7 @@
 //! qel - a git implementation in pure Rust std.
 mod commands;
 mod config;
+mod credential;
 mod diff;
 mod ignore;
 mod index;

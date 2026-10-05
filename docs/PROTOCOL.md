@@ -1,9 +1,46 @@
-# Wire protocol notes (protocol v0)
+# Wire protocol notes (v0 and v2)
 
-qel implements both ends of the Git "smart" protocol v0 as documented in
-`Documentation/technical/pack-protocol.txt` and `protocol-common.txt` of the
-git source tree. This file captures the shape of each exchange and the
-edge cases that matter.
+qel implements both ends of the Git "smart" protocol — v0 as documented in
+`Documentation/technical/pack-protocol.txt`/`protocol-common.txt`, and v2
+as documented in `protocol-v2.txt` — in the git source tree. This file
+captures the shape of each exchange and the edge cases that matter.
+
+## Protocol v2
+
+### Negotiation
+
+- `git://`: the client appends `\0\0version=2\0` to the service request
+  pkt-line. The server peeks at the request *before* deciding which
+  protocol to speak — a read-ahead wrapper (`PeekConn`) hands any
+  over-read bytes back to the v0 path so probing never consumes data.
+- `http(s)://`: every request carries `Git-Protocol: version=2`; each v2
+  command is its own POST (stateless).
+- `ssh://`: `GIT_PROTOCOL=version=2` is set on the remote environment.
+- Fallback: if the v0 advertisement arrives instead of `version 2`, the
+  client silently continues with v0 (`GIT_PROTOCOL=version=0` pins it).
+
+### Wire shape
+
+- The server answers a v2 request with `version 2` + capability lines
+  (`agent=…`, `ls-refs=unborn`, `fetch=shallow wait-for-done`,
+  `server-option`, `object-format=sha1`, `object-info`).
+- Commands are `command=<name>` + one pkt-line **per** capability + `0001`
+  delim + one pkt-line per argument + flush. (Caps must not be joined into
+  one line — the server aborts the connection on a malformed line.)
+- `ls-refs` refs carry attributes on the same line:
+  `symref-target:<ref>` for HEAD, `peeled:<oid>` for annotated tags,
+  `unborn <name> symref-target:<ref>` for unborn HEADs.
+- `fetch` args are `want`/`have`/`done`/`deepen`/`shallow`/`deepen-since`/
+  `deepen-not`/`filter`. `done` is only legal when the client advertised
+  `wait-for-done` — otherwise the server hangs up mid-session.
+- The v2 `fetch` reply is a sequence of section headers as pkt-lines:
+  `acknowledgments` (`ACK <oid>`/`ready`), delim, `shallow-info`
+  (`shallow`/`unshallow` lines), `wanted-refs`, `packfile`, then the pack
+  in side-band channel-1 chunks. Unknown section headers must be skipped,
+  not treated as side-band data (the first byte of `shallow-info` is `s`,
+  not a channel).
+- `sideband-all` is **not** a valid fetch arg (server kills the
+  connection); the packfile section is always banded anyway.
 
 ## Framing
 
@@ -34,14 +71,21 @@ Everything except raw pack data is pkt-line framed:
 
 Client sends `want <oid> <caps>` lines (space-separated caps on the first
 line — **not** NUL-separated like the advertisement), then flush, then
-`have <oid>` lines, then `done`.
+optional `shallow <oid>` boundary lines, `deepen <n>` requests, `have
+<oid>` lines, then `done`.
 
 Server responds after `done`:
 
 ```
+shallow <oid>                → boundary commits for depth-limited fetches
+unshallow <oid>              → boundary commits the client already has
 NAK                          → send the FULL closure of wants, or
 ACK <oid>                    → send wants minus reachable(acked haves)
 ```
+
+The client persists `shallow` lines to `.git/shallow`; `unshallow` removes
+entries; an empty set deletes the file. Commit-parent traversal stops at
+the boundary everywhere (rev-list, merge-base, pack closure).
 
 Important details that were easy to get wrong:
 
@@ -91,7 +135,7 @@ Validation performed by `qel receive-pack` (matching git defaults):
 |---|---|
 | `git://` | TCP :9418; request is one pkt-line `git-<svc> <path>\0host=<h>\0` then the phases above directly on the socket |
 | `ssh://`, `user@host:path` | spawn `ssh host 'git-<svc> <path>'` (honors `GIT_SSH`, `GIT_SSH_COMMAND`); protocol runs over the pipes |
-| `http(s)://` | request/response via `curl`: `GET /info/refs?service=git-<svc>` (`# service=` banner pkt then advertisement), `POST /git-<svc>` with the negotiation body; no `Git-Protocol` header ⇒ v0 |
+| `http(s)://` | request/response via `curl`: `GET /info/refs?service=git-<svc>` (`# service=` banner pkt then advertisement), `POST /git-<svc>` with the negotiation body; `Git-Protocol: version=2` switches to per-command v2 POSTs |
 | local path | no wire protocol — objects are copied (fetch) / written (push) directly |
 
 ## Daemon
