@@ -73,8 +73,11 @@ worktree.rs    directory scan honoring ignore rules, file hashing (blob form),
 pktline.rs     4-hex-length framing, flush/delim packets, read_until_flush
 transport.rs   Url parsing (git://, ssh://, scp-like, http(s), file://),
                Conn = Tcp | spawned-ssh duplex | PeekConn (v2 probe
-               read-ahead), HTTP(S) via curl subprocess (GET info/refs,
-               POST service), GIT_SSH(_COMMAND) honored, temp-netrc auth
+               read-ahead, write batching), HTTP(S) via ureq+rustls
+               (GET info/refs, POST service; pooled connections, env
+               proxies), native SSH via russh+tokio (agent + id_* keys,
+               known_hosts accept-new / key-change reject),
+               GIT_SSH(_COMMAND) honored as override
 credential.rs  credential.helper protocol: fill/approve/reject →
                get/store/erase ops, credential.<url>.helper matching,
                !shell and git credential-<name> helper forms
@@ -114,8 +117,9 @@ matching git's fatal-exit convention.
 
 - No external crates, no FFI, no unsafe except where edition-2024 requires it
   (`std::env::set_var`).
-- No shelling out to git for core behavior — `ssh`/`GIT_SSH` for transport,
-  `curl` for HTTP(S), and configured `credential.helper`s are the only
+- No shelling out to git for core behavior — transports are in-crate
+  (russh, ureq); configured `credential.helper`s and `GIT_SSH` overrides
+  are the only
   spawned tools.
 - Shallow state is a single `.git/shallow` file read once into a cached
   `Rc<HashSet<Oid>>` on `Repo`; every parent traversal (rev-list,

@@ -134,8 +134,8 @@ Validation performed by `qel receive-pack` (matching git defaults):
 | Scheme | Mechanism |
 |---|---|
 | `git://` | TCP :9418; request is one pkt-line `git-<svc> <path>\0host=<h>\0` then the phases above directly on the socket |
-| `ssh://`, `user@host:path` | spawn `ssh host 'git-<svc> <path>'` (honors `GIT_SSH`, `GIT_SSH_COMMAND`); protocol runs over the pipes |
-| `http(s)://` | request/response via `curl`: `GET /info/refs?service=git-<svc>` (`# service=` banner pkt then advertisement), `POST /git-<svc>` with the negotiation body; `Git-Protocol: version=2` switches to per-command v2 POSTs |
+| `ssh://`, `user@host:path` | native russh exec channel `git-<svc> '<path>'` (ssh-agent + `~/.ssh/id_*`, known_hosts accept-new with key-change rejection; `GIT_SSH`/`GIT_SSH_COMMAND` honored as overrides); protocol runs over the channel |
+| `http(s)://` | request/response via ureq/rustls (pooled): `GET /info/refs?service=git-<svc>` (`# service=` banner pkt then advertisement), `POST /git-<svc>` with the negotiation body; `Git-Protocol: version=2` switches to per-command v2 POSTs |
 | local path | no wire protocol — objects are copied (fetch) / written (push) directly |
 
 ## Daemon

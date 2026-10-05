@@ -9,7 +9,11 @@ keywords = ["git", "vcs", "protocol"]
 categories = ["command-line-utilities"]
 
 [dependencies]
+base64 = "0.23.1"
 crc32fast = "1.5.2"
 flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs"] }
 libc = "0.2.190"
+russh = "0.64.1"
 sha1 = "0.11.0"
+tokio = { version = "1.53.2", features = ["rt", "macros", "sync", "net", "io-util"] }
+ureq = { version = "3.4.2", default-features = false, features = ["rustls", "platform-verifier"] }

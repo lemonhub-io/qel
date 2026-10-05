@@ -3,10 +3,12 @@
 A complete Git implementation in Rust. **Every Git behavior is implemented
 in-tree** — the object model, the index, refs, packfiles and delta chains,
 the pkt-line wire protocol, transports, and both ends of protocols v0
-**and v2**. The only external crates are byte-level primitives:
-zlib compression ([`zlib-rs`](https://github.com/trifectatechfoundation/zlib-rs)
-via `flate2`), SHA-1 (RustCrypto `sha1`), and CRC32 (`crc32fast`) — formats,
-negotiation, and semantics are all ours.
+**and v2**. The only external crates are byte-level and wire-level
+primitives: zlib compression ([`zlib-rs`](https://github.com/trifectatechfoundation/zlib-rs)
+via `flate2`), SHA-1 (RustCrypto `sha1`), CRC32 (`crc32fast`), TLS+HTTP
+(`rustls` via `ureq`), and SSH (`russh`/`tokio`) — object formats,
+protocol negotiation, and semantics are all ours. No `curl`, `ssh`, or
+OpenSSL installation is required.
 
 qel interoperates with real Git in both directions:
 
@@ -27,9 +29,10 @@ cargo build --release
 ```
 
 Requires a recent stable Rust toolchain (edition 2024). Dependencies are
-byte-level primitives only — `flate2` (zlib-rs backend), `sha1`,
-`crc32fast`, plus `libc` on Unix for SIGPIPE handling — all pure Rust,
-fetched by cargo as usual.
+byte-level and wire-level primitives only — `flate2` (zlib-rs backend),
+`sha1`, `crc32fast`, `base64`, `ureq`+`rustls` (HTTP/TLS), `russh`+`tokio`
+(SSH), plus `libc` on Unix for SIGPIPE handling — fetched by cargo as
+usual. No external binaries (`curl`, `ssh`, `openssl`) are needed.
 
 ## Usage
 
@@ -107,7 +110,7 @@ honors the usual environment variables: `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`,
 | Diff | Myers diff (linear refinement), unified output byte-identical to git for tested cases |
 | Merge | merge-base (paint-down), fast-forward, true 3-way merge, conflict markers, `merge-file` |
 | Protocol | pkt-line; **v0** advertisement + want/have (`multi_ack`, `multi_ack_detailed`); **v2** `ls-refs`, `fetch`, `shallow-info`, `unborn`, `symref-target`, `peeled`, `wait-for-done`; `side-band-64k`, `report-status`/`v2`, `delete-refs`, `atomic`; **shallow clones** (`--depth`, `--deepen`, `--unshallow`, `.git/shallow`) |
-| Transports | `git://` TCP, `ssh://` + scp-style via `ssh` subprocess, `http(s)://` smart protocol via `curl`, local paths |
+| Transports | `git://` TCP, `ssh://` + scp-style via native russh (agent/identity keys, known_hosts TOFU), `http(s)://` smart protocol via ureq+rustls, local paths — no `ssh`/`curl` binaries needed |
 | HTTP auth | `credential.helper` protocol (`fill`/`approve`/`reject` → `get`/`store`/`erase`), URL-embedded credentials, 401 retry, secrets via temp netrc |
 | Server | `upload-pack` (v0+v2, shallow), `receive-pack` (validation, deny-current-branch, reflogs), `daemon` |
 | Porcelain extras | `rebase` (+git-compatible state), `worktree`, `bisect` (`refs/bisect`), `submodule`, `gc` (reflog-aware repack/prune) |

@@ -5,6 +5,28 @@ All notable changes to qel are documented here. The format follows
 
 ## [Unreleased]
 
+### Transports
+
+- **Native SSH transport**: `ssh://` and scp-like URLs now use an
+  in-crate `russh` client (single-thread `tokio` runtime bridged to
+  blocking I/O) — `ssh-agent` identities then `~/.ssh/id_*` keys in
+  openssh order, `known_hosts` accept-new with hard rejection on key
+  change, `GIT_PROTOCOL` env request for v2. `GIT_SSH`/`GIT_SSH_COMMAND`
+  remain honored as explicit overrides. No `ssh` binary required.
+  Password/keyboard-interactive auth is not supported — set `GIT_SSH`
+  for those setups.
+- **Native HTTPS transport**: smart HTTP now uses `ureq` over `rustls`
+  (with `rustls-platform-verifier` for OS trust stores) — a shared
+  connection pool across the info/refs + POST sequence, env proxy
+  support, redirects. Credentials are sent as an `Authorization` header;
+  the temp-netrc dance is gone. No `curl` binary or OpenSSL required.
+- Write batching on all streaming conns (git://, ssh://): pkt-line
+  writes buffer and flush before each read, collapsing one syscall per
+  pkt-line into one per negotiation round.
+- `ls-remote` accepts ref patterns after the remote (`ls-remote origin
+  HEAD` filters correctly) — previously every positional arg overwrote
+  the remote name.
+
 ### Changed
 
 - **Parallel `pack-objects`**: deltification is split across threads

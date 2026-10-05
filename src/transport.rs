@@ -1,5 +1,6 @@
-//! Transports: git:// (TCP 9418), ssh:// & scp-like (ssh subprocess),
-//! http(s):// via curl (smart HTTP is request/response, not streaming),
+//! Transports: git:// (TCP 9418), ssh:// & scp-like via native russh
+//! (GIT_SSH/GIT_SSH_COMMAND honored as overrides), http(s):// via
+//! ureq+rustls (smart HTTP is request/response, not streaming),
 //! and local paths (handled by caller, no transport needed).
 
 use crate::pktline;
@@ -11,6 +12,8 @@ use std::process::{Child, Command, Stdio};
 pub enum Conn {
     Tcp(TcpStream),
     Proc(Child),
+    /// Native SSH channel via russh.
+    Ssh(Box<SshConn>),
     /// A Conn with a read-ahead buffer (protocol version probing).
     Peek(Box<PeekConn>),
 }
@@ -20,6 +23,7 @@ impl Read for Conn {
         match self {
             Conn::Tcp(s) => s.read(buf),
             Conn::Proc(c) => c.stdout.as_mut().unwrap().read(buf),
+            Conn::Ssh(c) => c.read(buf),
             Conn::Peek(p) => p.read(buf),
         }
     }
@@ -30,6 +34,7 @@ impl Write for Conn {
         match self {
             Conn::Tcp(s) => s.write(buf),
             Conn::Proc(c) => c.stdin.as_mut().unwrap().write(buf),
+            Conn::Ssh(c) => c.write(buf),
             Conn::Peek(p) => p.write(buf),
         }
     }
@@ -37,23 +42,33 @@ impl Write for Conn {
         match self {
             Conn::Tcp(s) => s.flush(),
             Conn::Proc(c) => c.stdin.as_mut().unwrap().flush(),
+            Conn::Ssh(_) => Ok(()), // channel sends are immediate
             Conn::Peek(p) => p.flush(),
         }
     }
 }
 
 /// A Conn wrapper that can read ahead without losing bytes.
+/// Also buffers writes: pkt-line requests are small and numerous, so
+/// bytes batch until a read (the protocol is strict request/response)
+/// or an explicit flush — one syscall per negotiation round instead of
+/// one per pkt-line.
 pub struct PeekConn {
     pub inner: Conn,
     pub buf: Vec<u8>,
+    wbuf: Vec<u8>,
 }
 
 impl PeekConn {
     pub fn new(inner: Conn) -> Self {
-        PeekConn { inner, buf: Vec::new() }
+        PeekConn { inner, buf: Vec::new(), wbuf: Vec::new() }
     }
     /// Fill the peek buffer to at least n bytes (best effort).
     pub fn fill(&mut self, n: usize) -> std::io::Result<()> {
+        if self.buf.len() < n && !self.wbuf.is_empty() {
+            // request phase complete — push it out before waiting
+            self.flush()?;
+        }
         while self.buf.len() < n {
             let mut tmp = [0u8; 8192];
             let got = self.inner.read(&mut tmp)?;
@@ -106,39 +121,55 @@ impl Read for PeekConn {
             self.buf.drain(..n);
             return Ok(n);
         }
+        if !self.wbuf.is_empty() {
+            self.flush()?;
+        }
         self.inner.read(out)
     }
 }
 
 impl Write for PeekConn {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.inner.write(buf)
+        self.wbuf.extend_from_slice(buf);
+        Ok(buf.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
+        if !self.wbuf.is_empty() {
+            self.inner.write_all(&self.wbuf)?;
+            self.wbuf.clear();
+        }
         self.inner.flush()
     }
 }
 
 impl Conn {
     /// Wait for subprocess transports (ssh) — important so ssh can report
-    /// errors and not become a zombie.
+    /// errors and not become a zombie. For russh channels, surface the
+    /// remote command's exit status.
     pub fn finish(&mut self) -> Result<()> {
-        let proc_ref = match self {
-            Conn::Proc(c) => Some(c),
-            Conn::Peek(p) => match &mut p.inner {
-                Conn::Proc(c) => Some(c),
-                _ => None,
-            },
-            _ => None,
-        };
-        if let Some(c) = proc_ref {
-            let st = c.wait()?;
-            if !st.success() {
-                return Err(GitError::Protocol(format!(
-                    "ssh transport exited with {}",
-                    st
-                )));
+        match self {
+            Conn::Proc(c) => {
+                let st = c.wait()?;
+                if !st.success() {
+                    return Err(GitError::Protocol(format!(
+                        "ssh transport exited with {}",
+                        st
+                    )));
+                }
             }
+            Conn::Ssh(s) => {
+                let st = s.exit_status();
+                if let Some(code) = st {
+                    if code != 0 {
+                        return Err(GitError::Protocol(format!(
+                            "remote command exited with {}",
+                            code
+                        )));
+                    }
+                }
+            }
+            Conn::Peek(p) => p.inner.finish()?,
+            _ => {}
         }
         Ok(())
     }
@@ -233,39 +264,50 @@ pub fn connect_v2(url: &Url, service: &str) -> Result<Conn> {
 fn connect_version(url: &Url, service: &str, v2: bool) -> Result<Conn> {
     match url {
         Url::Git { host, port, path } => {
-            let mut s = TcpStream::connect(format!("{}:{}", host, port))?;
+            let s = TcpStream::connect(format!("{}:{}", host, port))?;
             s.set_nodelay(true).ok();
             let extra = if v2 { "\0version=2\0" } else { "" };
             let req = format!("{} {}\0host={}\0{}", service, path, host, extra);
-            s.write_all(&pktline::encode_str(&req))?;
-            Ok(Conn::Tcp(s))
+            let mut c = PeekConn::new(Conn::Tcp(s));
+            c.write_all(&pktline::encode_str(&req))?;
+            c.flush()?;
+            Ok(Conn::Peek(Box::new(c)))
         }
         Url::Ssh { user, host, port, path } => {
-            let mut cmd = ssh_command();
-            if let Some(p) = port {
-                cmd.arg("-p").arg(p.to_string());
-            }
-            if v2 {
-                // GIT_PROTOCOL is how the client asks for v2 over ssh —
-                // the remote side only sees it if AcceptEnv/SendEnv allows
-                // or the command wrapper propagates it.
-                cmd.arg("-o").arg("SendEnv=GIT_PROTOCOL");
-                unsafe {
-                    std::env::set_var("GIT_PROTOCOL", "version=2");
+            let command = format!("{} '{}'", service, path.replace('\'', "'\\''"));
+            // GIT_SSH/GIT_SSH_COMMAND are explicit user overrides —
+            // honor them, otherwise use the native russh transport.
+            if let Some(mut cmd) = ssh_command_override() {
+                if let Some(p) = port {
+                    cmd.arg("-p").arg(p.to_string());
                 }
+                if v2 {
+                    cmd.arg("-o").arg("SendEnv=GIT_PROTOCOL");
+                    unsafe {
+                        std::env::set_var("GIT_PROTOCOL", "version=2");
+                    }
+                }
+                cmd.arg(match user {
+                    Some(u) => format!("{}@{}", u, host),
+                    None => host.clone(),
+                });
+                cmd.arg(&command);
+                let child = cmd
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::inherit())
+                    .spawn()?;
+                Ok(Conn::Proc(child))
+            } else {
+                let conn = ssh_connect(
+                    user.as_deref(),
+                    host,
+                    port.unwrap_or(22),
+                    &command,
+                    v2,
+                )?;
+                Ok(Conn::Peek(Box::new(PeekConn::new(Conn::Ssh(Box::new(conn))))))
             }
-            cmd.arg(match user {
-                Some(u) => format!("{}@{}", u, host),
-                None => host.clone(),
-            });
-            cmd.arg(format!("{} '{}'", service, path.replace('\'', "'\\''")));
-            let child = cmd
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::inherit())
-                .spawn()?;
-            // drain any immediate failures
-            Ok(Conn::Proc(child))
         }
         Url::Http { .. } => Err(GitError::Protocol(
             "http transport is request/response; use http_fetch".into(),
@@ -276,21 +318,313 @@ fn connect_version(url: &Url, service: &str, v2: bool) -> Result<Conn> {
     }
 }
 
-fn ssh_command() -> Command {
+/// Explicit user override only — when set, spawn that command instead of
+/// the native SSH transport. Returns None when neither var is set.
+fn ssh_command_override() -> Option<Command> {
     if let Ok(custom) = std::env::var("GIT_SSH") {
-        // GIT_SSH is a command path; GIT_SSH_COMMAND can contain args
-        Command::new(custom)
+        Some(Command::new(custom))
     } else if let Ok(custom) = std::env::var("GIT_SSH_COMMAND") {
         let mut it = custom.split_whitespace();
         let mut c = Command::new(it.next().unwrap_or("ssh"));
         c.args(it);
-        return c;
+        Some(c)
     } else {
-        Command::new("ssh")
+        None
     }
 }
 
-// ============================== HTTP(S) via curl ==============================
+// ============================== SSH via russh ==============================
+
+/// Messages from the sync writer side to the async channel pump.
+enum SshOut {
+    Data(Vec<u8>),
+    Close,
+}
+
+/// Blocking Read/Write adapter over a russh session channel. A dedicated
+/// thread runs a single-thread tokio runtime driving the SSH connection;
+/// bytes cross via channels.
+pub struct SshConn {
+    in_rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    pending: std::collections::VecDeque<u8>,
+    out_tx: tokio::sync::mpsc::UnboundedSender<SshOut>,
+    exit: std::sync::Arc<std::sync::Mutex<Option<u32>>>,
+    _thread: std::thread::JoinHandle<()>,
+}
+
+impl SshConn {
+    pub fn exit_status(&self) -> Option<u32> {
+        *self.exit.lock().unwrap()
+    }
+}
+
+impl Read for SshConn {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if let Some(b) = self.pending.pop_front() {
+                buf[0] = b;
+                // drain as much pending as fits
+                let mut n = 1;
+                while n < buf.len() {
+                    match self.pending.pop_front() {
+                        Some(b) => {
+                            buf[n] = b;
+                            n += 1;
+                        }
+                        None => break,
+                    }
+                }
+                return Ok(n);
+            }
+            match self.in_rx.recv() {
+                Ok(chunk) => self.pending.extend(chunk.iter().copied()),
+                Err(_) => return Ok(0), // channel closed = remote EOF
+            }
+        }
+    }
+}
+
+impl Write for SshConn {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.out_tx
+            .send(SshOut::Data(buf.to_vec()))
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "ssh channel closed")
+            })?;
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for SshConn {
+    fn drop(&mut self) {
+        let _ = self.out_tx.send(SshOut::Close);
+    }
+}
+
+struct SshHandler {
+    host: String,
+    port: u16,
+}
+
+impl russh::client::Handler for SshHandler {
+    type Error = russh::Error;
+
+    async fn check_server_key(
+        &mut self,
+        key: &russh::keys::PublicKeyOrCertificate,
+    ) -> std::result::Result<bool, Self::Error> {
+        use russh::keys::PublicKeyOrCertificate;
+        let pubkey = match key {
+            PublicKeyOrCertificate::PublicKey { key, .. } => key.clone(),
+            PublicKeyOrCertificate::Certificate(c) => c.public_key().clone().into(),
+        };
+        match russh::keys::check_known_hosts(&self.host, self.port, &pubkey) {
+            Ok(true) => Ok(true),
+            // KeyChanged = MITM protection: hard reject, matching openssh.
+            Err(russh::keys::Error::KeyChanged { .. }) => {
+                eprintln!(
+                    "WARNING: remote host identification has changed for {}",
+                    self.host
+                );
+                Ok(false)
+            }
+            // Unknown or unreadable file: accept-new (TOFU), like
+            // StrictHostKeyChecking=accept-new.
+            _ => {
+                eprintln!(
+                    "Warning: Permanently added '{}' to the list of known hosts.",
+                    self.host
+                );
+                let _ = russh::keys::known_hosts::learn_known_hosts(&self.host, self.port, &pubkey);
+                Ok(true)
+            }
+        }
+    }
+}
+
+fn ssh_home() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(std::path::PathBuf::from))
+}
+
+/// Try agent identities, then ~/.ssh/id_* files — openssh's default order.
+async fn ssh_authenticate<H: russh::client::Handler>(
+    session: &mut russh::client::Handle<H>,
+    user: &str,
+) -> Result<()> {
+    use russh::keys::agent::client::AgentClient;
+    use russh::keys::agent::AgentIdentity;
+    if let Ok(mut agent) = AgentClient::connect_env().await {
+        if let Ok(ids) = agent.request_identities().await {
+            for id in ids {
+                // certificate identities need cert auth — pubkey only here
+                if let AgentIdentity::PublicKey { key, .. } = &id {
+                    let pk = key.clone();
+                    if let Ok(res) = session
+                        .authenticate_publickey_with(user, pk, None, &mut agent)
+                        .await
+                    {
+                        if res.success() {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(home) = ssh_home() {
+        for name in ["id_ed25519", "id_ecdsa", "id_rsa", "id_dsa"] {
+            let path = home.join(".ssh").join(name);
+            let Ok(key) = russh::keys::load_secret_key(&path, None) else {
+                continue;
+            };
+            let hash_alg = if key.algorithm().is_rsa() {
+                session.best_supported_rsa_hash().await.ok().flatten().flatten()
+            } else {
+                None
+            };
+            let key = russh::keys::PrivateKeyWithHashAlg::new(
+                std::sync::Arc::new(key),
+                hash_alg,
+            );
+            if let Ok(res) = session.authenticate_publickey(user, key).await {
+                if res.success() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    Err(GitError::Protocol(format!(
+        "ssh authentication failed for {user} (agent + default keys tried; \
+         password/keyboard-interactive unsupported — use GIT_SSH for those)"
+    )))
+}
+
+/// Open an SSH exec channel running `command` (e.g. "git-upload-pack 'path'").
+/// Connect/auth errors are reported synchronously; afterwards bytes flow
+/// through SshConn's channel bridge.
+fn ssh_connect(
+    user: Option<&str>,
+    host: &str,
+    port: u16,
+    command: &str,
+    v2: bool,
+) -> Result<SshConn> {
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<()>>();
+    let (in_tx, in_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<SshOut>();
+    let exit = std::sync::Arc::new(std::sync::Mutex::new(None::<u32>));
+    let exit2 = exit.clone();
+    let (host_s, cmd_s, user_s) = (host.to_string(), command.to_string(), user.map(str::to_string));
+    let thread = std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                let _ = ready_tx.send(Err(GitError::Io(e)));
+                return;
+            }
+        };
+        rt.block_on(async move {
+            let cfg = std::sync::Arc::new(russh::client::Config {
+                nodelay: true,
+                inactivity_timeout: None,
+                ..Default::default()
+            });
+            let handler = SshHandler {
+                host: host_s.clone(),
+                port,
+            };
+            let user = user_s
+                .or_else(|| std::env::var("LOGNAME").ok())
+                .or_else(|| std::env::var("USER").ok())
+                .unwrap_or_else(|| "git".into());
+            let result = async {
+                let mut session = russh::client::connect(
+                    cfg,
+                    (host_s.as_str(), port),
+                    handler,
+                )
+                .await
+                .map_err(|e| GitError::Protocol(format!("ssh connect: {e}")))?;
+                ssh_authenticate(&mut session, &user).await?;
+                let ch = session
+                    .channel_open_session()
+                    .await
+                    .map_err(|e| GitError::Protocol(format!("ssh channel: {e}")))?;
+                if v2 {
+                    // GIT_PROTOCOL env request — servers whitelist via
+                    // AcceptEnv; rejection is harmless (v0 fallback).
+                    let _ = ch.set_env(false, "GIT_PROTOCOL", "version=2").await;
+                }
+                ch.exec(true, cmd_s.into_bytes())
+                    .await
+                    .map_err(|e| GitError::Protocol(format!("ssh exec: {e}")))?;
+                Ok::<_, GitError>(ch)
+            }
+            .await;
+            let mut ch = match result {
+                Ok(ch) => ch,
+                Err(e) => {
+                    let _ = ready_tx.send(Err(e));
+                    return;
+                }
+            };
+            if ready_tx.send(Ok(())).is_err() {
+                return;
+            }
+            use russh::ChannelMsg;
+            loop {
+                tokio::select! {
+                    msg = ch.wait() => match msg {
+                        Some(ChannelMsg::Data { data }) => {
+                            if in_tx.send(data.to_vec()).is_err() {
+                                break; // reader gone
+                            }
+                        }
+                        // stderr from the remote side — print, like ssh does
+                        Some(ChannelMsg::ExtendedData { data, ext }) if ext == 1 => {
+                            eprint!("{}", String::from_utf8_lossy(&data));
+                        }
+                        Some(ChannelMsg::ExitStatus { exit_status }) => {
+                            *exit2.lock().unwrap() = Some(exit_status);
+                        }
+                        Some(ChannelMsg::Close) | Some(ChannelMsg::Eof) | None => break,
+                        _ => {}
+                    },
+                    out = out_rx.recv() => match out {
+                        Some(SshOut::Data(d)) => {
+                            if ch.data_bytes(d).await.is_err() {
+                                break;
+                            }
+                        }
+                        Some(SshOut::Close) | None => break,
+                    }
+                }
+            }
+            let _ = ch.close().await;
+        });
+    });
+    match ready_rx.recv() {
+        Ok(Ok(())) => Ok(SshConn {
+            in_rx,
+            pending: Default::default(),
+            out_tx,
+            exit,
+            _thread: thread,
+        }),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(GitError::Protocol("ssh worker thread died".into())),
+    }
+}
+
+// ============================== HTTP(S) via ureq/rustls ==============================
 
 pub struct HttpResponse {
     pub status: u32,
@@ -299,11 +633,27 @@ pub struct HttpResponse {
     pub body: Vec<u8>,
 }
 
-/// HTTP request via curl subprocess. `curl` handles TLS, auth embedded in
-/// the URL, proxies and redirects — same responsibility libcurl has in
-/// real git.
-/// `auth` supplies (user, password) via a temp netrc file so the secret
-/// never appears on the command line.
+/// Shared agent so connection reuse (TLS session, keep-alive) applies to
+/// the info/refs + POST sequence within a command.
+fn http_agent() -> &'static ureq::Agent {
+    use std::sync::OnceLock;
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::Agent::config_builder()
+            // 4xx/5xx arrive as Ok responses — callers inspect status
+            // (the 401 credential-retry path depends on this).
+            .http_status_as_error(false)
+            .max_redirects(5)
+            // git defaults: follow env proxies (http_proxy/https_proxy/no_proxy).
+            .proxy(ureq::Proxy::try_from_env())
+            .user_agent(format!("qel/{}", env!("CARGO_PKG_VERSION")))
+            .build()
+            .into()
+    })
+}
+
+/// HTTP request over ureq/rustls — pure-Rust TLS, no curl/openssl needed.
+/// `auth` is passed as an Authorization header (no temp netrc needed).
 #[allow(dead_code)]
 pub fn http_request(
     method: &str,
@@ -321,92 +671,54 @@ pub fn http_request_auth(
     body: Option<&[u8]>,
     auth: Option<(&str, &str)>,
 ) -> Result<HttpResponse> {
-    let mut cmd = Command::new("curl");
-    cmd.arg("-sS")
-        .arg("-L") // follow redirects
-        .arg("--max-redirs").arg("5")
-        .arg("-X").arg(method)
-        .arg("-D").arg("-"); // dump headers to stdout; body to temp file
-    let netrc_path;
-    if let Some((u, p)) = auth {
-        let host = url
-            .split("://")
-            .nth(1)
-            .and_then(|s| s.split('/').next())
-            .unwrap_or("")
-            .split('@')
-            .last()
-            .unwrap_or("")
-            .split(':')
-            .next()
-            .unwrap_or("")
-            .to_string();
-        netrc_path = std::env::temp_dir().join(format!("qel-netrc-{}", std::process::id()));
-        std::fs::write(
-            &netrc_path,
-            format!("machine {} login {} password {}\n", host, u, p),
-        )?;
-        // netrc must be user-private or curl ignores it
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(
-                &netrc_path,
-                std::fs::Permissions::from_mode(0o600),
-            );
+    use base64::Engine;
+    let agent = http_agent();
+    let auth_header = auth.map(|(u, p)| {
+        format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("{u}:{p}"))
+        )
+    });
+    // git's smart-HTTP only uses GET (info/refs, dumb fetch) and POST
+    // (service requests). Treat anything else as GET.
+    let mut resp = if method == "POST" || body.is_some() {
+        let mut b = agent.post(url);
+        for &(k, v) in headers {
+            b = b.header(k, v);
         }
-        cmd.arg("--netrc-file").arg(&netrc_path);
+        if let Some(a) = &auth_header {
+            b = b.header("Authorization", a);
+        }
+        match body {
+            Some(d) => b.send(d),
+            None => b.send_empty(),
+        }
     } else {
-        netrc_path = std::path::PathBuf::new();
-    }
-    let tmp_in;
-    if let Some(b) = body {
-        tmp_in = std::env::temp_dir().join(format!("qel-req-{}", std::process::id()));
-        std::fs::write(&tmp_in, b)?;
-        cmd.arg("--data-binary").arg(format!("@{}", tmp_in.display()));
-    }
-    for (k, v) in headers {
-        cmd.arg("-H").arg(format!("{}: {}", k, v));
-    }
-    let tmp_out = std::env::temp_dir().join(format!("qel-resp-{}", std::process::id()));
-    cmd.arg("-o").arg(&tmp_out).arg(url);
-    let out = cmd.output()?;
-    let body_bytes = std::fs::read(&tmp_out).unwrap_or_default();
-    let _ = std::fs::remove_file(&tmp_out);
-    if auth.is_some() {
-        let _ = std::fs::remove_file(&netrc_path);
-    }
-    if body.is_some() {
-        let _ = std::fs::remove_file(std::env::temp_dir().join(format!("qel-req-{}", std::process::id())));
-    }
-    if !out.status.success() {
-        return Err(GitError::Protocol(format!(
-            "curl failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        )));
-    }
-    // headers from -D - may contain multiple responses (redirects); take last
-    let header_text = String::from_utf8_lossy(&out.stdout);
-    let mut status = 0u32;
-    let mut hdrs = Vec::new();
-    for block in header_text.split("\r\n\r\n") {
-        let mut lines = block.lines();
-        if let Some(first) = lines.next() {
-            if first.starts_with("HTTP/") {
-                status = first
-                    .split_whitespace()
-                    .nth(1)
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0);
-                hdrs.clear();
-            }
+        let mut b = agent.get(url);
+        for &(k, v) in headers {
+            b = b.header(k, v);
         }
-        for line in lines {
-            if let Some((k, v)) = line.split_once(':') {
-                hdrs.push((k.trim().to_lowercase(), v.trim().to_string()));
-            }
+        if let Some(a) = &auth_header {
+            b = b.header("Authorization", a);
         }
+        b.call()
     }
+    .map_err(|e| GitError::Protocol(format!("http {method} {url} failed: {e}")))?;
+    let status = resp.status().as_u16() as u32;
+    let hdrs = resp
+        .headers()
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.as_str().to_lowercase(),
+                v.to_str().unwrap_or("").to_string(),
+            )
+        })
+        .collect();
+    let body_bytes = resp
+        .body_mut()
+        .read_to_vec()
+        .map_err(|e| GitError::Protocol(format!("http read body: {e}")))?;
     Ok(HttpResponse { status, headers: hdrs, body: body_bytes })
 }
 

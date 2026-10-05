@@ -1030,17 +1030,23 @@ fn push_local(
 
 fn cmd_ls_remote(args: &[String]) -> Result<i32> {
     let repo = get_repo().ok();
-    let mut name = "origin".to_string();
-    for a in args {
-        if !a.starts_with('-') {
-            name = a.clone();
-        }
-    }
+    let mut positional = args.iter().filter(|a| !a.starts_with('-'));
+    // first positional is the remote/URL; the rest are ref patterns
+    let name = positional.next().cloned().unwrap_or_else(|| "origin".to_string());
+    let patterns: Vec<String> = positional.cloned().collect();
     let url_str = match repo.as_ref().and_then(|r| r.config_get(&format!("remote.{}.url", name))) {
         Some(u) => u,
         None => name.clone(), // treat arg as URL
     };
     let url = transport::parse_url(&url_str)?;
+    // git ls-remote: a pattern matches if it equals the refname or a
+    // trailing /-separated portion of it ("HEAD", "refs/heads/*" style).
+    let matches = |name: &str| -> bool {
+        patterns.is_empty()
+            || patterns.iter().any(|p| {
+                name == p || name.ends_with(&format!("/{p}"))
+            })
+    };
     match &url {
         Url::Local { path } => {
             let mut p = std::path::PathBuf::from(path);
@@ -1048,22 +1054,28 @@ fn cmd_ls_remote(args: &[String]) -> Result<i32> {
                 p = p.join(".git");
             }
             let r = Repo::open(&p, None)?;
-            if let Some(h) = r.head_oid()? {
-                println!("{} HEAD", h.hex());
+            if matches("HEAD") {
+                if let Some(h) = r.head_oid()? {
+                    println!("{} HEAD", h.hex());
+                }
             }
             for (n, o) in r.list_refs("refs/")? {
-                println!("{} {}", o.hex(), n);
+                if matches(&n) {
+                    println!("{} {}", o.hex(), n);
+                }
             }
         }
         _ => {
             let mut session = protocol::open_fetch_session(&url, repo.map(|r| r.common_dir.join("config")).as_deref())?;
             let ad = session.ad.clone();
             session.finish().ok();
-            if let Some(h) = ad.head_oid {
-                println!("{} HEAD", h.hex());
+            if matches("HEAD") {
+                if let Some(h) = ad.head_oid {
+                    println!("{} HEAD", h.hex());
+                }
             }
             for (n, o) in &ad.refs {
-                if n == "HEAD" {
+                if n == "HEAD" || !matches(n) {
                     continue;
                 }
                 println!("{} {}", o.hex(), n);

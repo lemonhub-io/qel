@@ -27,16 +27,17 @@ export GIT_COMMITTER_NAME=Test GIT_COMMITTER_EMAIL=t@e.st
 
 ## Project rules
 
-1. **Dependencies are limited to byte-level primitives.** Compression
-   (zlib), hashing (SHA-1), and checksums (CRC32) may come from
-   maintained crates — they are formats' building blocks, not Git logic.
-   Everything that makes Git *Git* — the object model, pack/idx formats,
-   delta resolution, refs, the index, pkt-line, protocol negotiation,
-   diff — stays implemented in `src/`. Never add a crate that provides
-   Git functionality (object stores, transports, porcelain helpers,
-   libgit2 bindings).
+1. **Dependencies are limited to byte-level and wire-level primitives.**
+   Compression (zlib), hashing (SHA-1), checksums (CRC32), and transport
+   plumbing (TLS via rustls/ureq, SSH via russh/tokio) may come from
+   maintained crates — they are formats' building blocks and sockets,
+   not Git logic. Everything that makes Git *Git* — the object model,
+   pack/idx formats, delta resolution, refs, the index, pkt-line,
+   protocol negotiation, diff — stays implemented in `src/`. Never add
+   a crate that provides Git functionality (object stores, transport
+   protocol helpers, porcelain helpers, libgit2 bindings).
 2. **No shelling out to git for core behavior.** The only spawned programs
-   are `ssh` (ssh transport), `curl` (HTTPS transport), and the editor for
+   are the editor for
    `commit` without `-m`. If you find yourself wanting `Command::new("git")`,
    that's the bug.
 3. **Git compatibility is the spec.** When behavior is ambiguous, match

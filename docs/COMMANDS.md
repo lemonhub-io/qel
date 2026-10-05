@@ -107,7 +107,7 @@ runs `store`, `reject` runs `erase`. Helper forms per git docs:
 `!shell…`, shell fragments, absolute paths, and named `git credential-*`
 helpers. Used automatically for `http(s)://` fetches/pushes: credentials
 are filled before the first request and approved/rejected after; secrets
-are passed to `curl` via a temp netrc file, never on the command line.
+are sent as an HTTP `Authorization` header, never on the command line.
 
 ## Serving repositories
 
