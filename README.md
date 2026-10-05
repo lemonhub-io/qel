@@ -142,6 +142,10 @@ Validated against Git 2.43.0:
 
 ## Known limitations
 
+- `qel fetch --unshallow` as a *client* has a traversal bug (it may
+  report "Failed to traverse parents" after receiving the full pack);
+  fetching again or cloning fresh works around it. Serving
+  `--unshallow`/`--deepen` to git clients is fully verified.
 - Protocol v2 covers `ls-refs`/`fetch`/`object-info`; `deepen-since`,
   `deepen-not`, `filter` (partial clone), `server-option` args and push-over-v2
   are not implemented (receive-pack stays v0, matching git).

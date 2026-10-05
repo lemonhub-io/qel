@@ -33,20 +33,22 @@ measured on identical repositories and workloads.
 | `hash-object -w` (20 MB) |   100 ms |  184 ms | 1.8x         |
 | `cat-file -p` (20 MB)    |    46 ms |  115 ms | 2.5x         |
 | `fsck`                   |  1484 ms |  822 ms | qel faster   |
-| `pack-objects`           |    15* ms| 1033 ms | see note     |
+| `pack-objects` (packed input) | 390* ms | 410 ms | ~tie         |
 | `index-pack`             |    12 ms |   14 ms | tie          |
 | `clone` (local path)     |     8 ms |    7 ms | ~tie         |
 | `clone` via `git://`     |   8–9 ms | 6–22 ms | tie, both directions |
 | `clone --depth=50`       |    86 ms |    6 ms | qel faster   |
 
-\* `git pack-objects` at 15 ms is reading already-packed objects and
-**reusing their delta chains** wholesale. When forced to deltify (no
-reusable source deltas) git measured ~133 ms on this object set, versus
-qel's ~1.0 s — qel now deltifies in parallel (per-thread windows, the
-same scheme as `git --threads`) but its single-object delta search is
-still ~8x slower. Two separate gaps remain: qel does not reuse source
-deltas when repacking, and its per-base delta index is simpler than
-git's size-bucketed multi-window search.
+\* On an already-packed object set (1,446 objects, 780 KB pack) both
+sides now **reuse source pack entries verbatim** — compressed payloads
+copied with only OFS-delta distances re-encoded — and land within noise
+of each other (best-of-3: qel 410 ms, git 390 ms; `git --no-reuse-delta`
+fresh deltification: ~1.5 s). On a smaller all-packed repo (360 objects)
+qel finished in ~15 ms, matching git's classic delta-reuse number. When
+the input is loose objects qel deltifies from scratch in parallel
+(per-thread windows, same scheme as `git --threads`); the remaining gap
+there is the delta search itself, which stays simpler than git's
+size-bucketed multi-window search.
 
 ## What switching the codec bought
 
@@ -93,11 +95,11 @@ each was fixed and re-verified for correctness:
 
 ## Remaining gaps
 
-- **`pack-objects`** — qel deltifies from scratch in parallel (per-thread
-  windows, same scheme as `git --threads`): ~1.0 s for 1,533 objects.
-  Git additionally *reuses* delta chains when repacking packed objects
-  (the 15 ms / 45 KB numbers). Implementing delta reuse for repack would
-  close most of the remaining gap on packed inputs.
+- **`pack-objects` on loose inputs** — packed inputs now reuse entries
+  verbatim at parity with git (~410 ms / ~15 ms measured). Loose inputs
+  still pay the full parallel deltification; git's fresh-deltify number
+  (~133 ms–1.5 s depending on object shape) stays ahead because its
+  delta search is more selective (skips hopeless pairs earlier).
 - **`cat-file`/`hash-object` (1.8–2.5x)** — single-call codec overhead
   plus qel's buffer copies; zlib itself is no longer the limiter.
 - **`blame` (~1.4x)** — per-commit diffs only when the blob oid actually

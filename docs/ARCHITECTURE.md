@@ -19,7 +19,9 @@ object.rs      Oid, ObjType, object header ("<type> <len>\0") framing,
                Commit/Tag/tree-entry parsing, Ident + timestamp handling
 pack.rs        pack + .idx reading and writing, EntryHeader parsing,
                OFS_DELTA/REF_DELTA resolution (incl. thin packs via a
-               resolver callback), store_pack, write_idx
+               resolver callback), delta creation, verbatim pack-entry
+               reuse (write_pack_mixed + reusable_entries), store_pack,
+               write_idx
 odb.rs         object database: loose objects + every .idx under
                objects/pack + .git/objects/info/alternates chains,
                prefix lookup, has/read/write, store_received_pack plumbing

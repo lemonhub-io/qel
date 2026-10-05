@@ -2951,25 +2951,23 @@ fn cmd_pack_objects(args: &[String]) -> Result<i32> {
             }
         }
     }
-    let mut all = revwalk::reachable_objects(&repo, &tips)?;
+    let mut all: Vec<Oid> = revwalk::reachable_objects(&repo, &tips)?
+        .into_iter()
+        .collect();
     all.extend(extra);
-    let mut objs = Vec::new();
-    for oid in all {
-        if let Ok(obj) = repo.odb.read(&oid) {
-            objs.push(crate::pack::PackObj {
-                oid,
-                ty: obj.0,
-                data: obj.1.clone(),
-            });
-        }
-    }
-    let (pack, oids) = crate::pack::write_pack_delta(&objs);
+    all.sort();
+    all.dedup();
+    // reuse packed entries verbatim (compressed delta chains intact);
+    // only loose/fallback objects get loaded + deltified.
+    let (reused, fresh) = repo.odb.pack_inputs(&all)?;
+    let (pack, metas) = crate::pack::write_pack_mixed(&fresh, reused)?;
     if out_file == "pack" || out_file == "-" {
         use std::io::Write;
         std::io::stdout().write_all(&pack)?;
     } else {
         std::fs::write(format!("{}.pack", out_file), &pack)?;
-        let idx = crate::pack::write_idx(&pack, &oids)?;
+        let (oids, offsets): (Vec<Oid>, Vec<u64>) = metas.into_iter().unzip();
+        let idx = crate::pack::write_idx_offsets(&pack, &oids, &offsets)?;
         std::fs::write(format!("{}.idx", out_file), idx)?;
         let hash = &pack[pack.len() - 20..];
         println!("{}", crate::util::to_hex(hash));
@@ -3475,20 +3473,9 @@ fn cmd_gc(_args: &[String]) -> Result<i32> {
         tips.push(e.oid);
     }
     let objects = revwalk::reachable_objects(&repo, &tips)?;
-    let mut pack_objs = Vec::new();
-    for oid in &objects {
-        let obj = repo.odb.read(oid)?;
-        pack_objs.push(crate::pack::PackObj {
-            oid: *oid,
-            ty: obj.0,
-            data: obj.1.clone(),
-        });
-    }
-    let new_pack = if !pack_objs.is_empty() {
-        Some(repo.odb.store_pack(&pack_objs)?)
-    } else {
-        None
-    };
+    let mut objects: Vec<Oid> = objects.into_iter().collect();
+    objects.sort();
+    let new_pack = repo.odb.store_pack_inputs(&objects)?;
     // prune loose objects now covered by the pack
     let objects_dir = repo.odb.primary_dir();
     let mut pruned = 0usize;

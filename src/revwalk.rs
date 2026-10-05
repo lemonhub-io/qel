@@ -90,6 +90,17 @@ pub fn reachable_set(repo: &Repo, tip: &Oid) -> Result<HashSet<Oid>> {
 /// Objects (commits, trees, blobs, tags) reachable from the given tips —
 /// used for pack generation & fsck.
 pub fn reachable_objects(repo: &Repo, tips: &[Oid]) -> Result<HashSet<Oid>> {
+    reachable_objects_if(repo, tips, &|o| repo.is_shallow(o))
+}
+
+/// Same walk as reachable_objects but the "don't follow parents" set is
+/// caller-supplied — used to model a *client's* shallow boundary (the
+/// local repo itself isn't shallow).
+pub fn reachable_objects_if(
+    repo: &Repo,
+    tips: &[Oid],
+    is_boundary: &dyn Fn(&Oid) -> bool,
+) -> Result<HashSet<Oid>> {
     let mut out: HashSet<Oid> = HashSet::new();
     let mut stack: Vec<Oid> = tips.to_vec();
     while let Some(o) = stack.pop() {
@@ -103,7 +114,7 @@ pub fn reachable_objects(repo: &Repo, tips: &[Oid]) -> Result<HashSet<Oid>> {
         match obj.0 {
             ObjType::Commit => {
                 let mut c = Commit::parse(&obj.1)?;
-                if repo.is_shallow(&o) {
+                if is_boundary(&o) {
                     c.parents.clear();
                 }
                 stack.push(c.tree);

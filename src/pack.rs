@@ -198,6 +198,8 @@ pub struct Pack {
     idx: IdxData,
     /// cache of resolved objects keyed by pack offset
     cache: RefCell<HashMap<u64, Rc<(ObjType, Vec<u8>)>>>,
+    /// entry offsets sorted ascending (idx order is by oid); lazy
+    sorted_offsets: RefCell<Option<Rc<Vec<u64>>>>,
 }
 
 fn load_idx(path: &Path) -> Result<IdxData> {
@@ -279,10 +281,44 @@ impl Pack {
             data,
             idx,
             cache: RefCell::new(HashMap::new()),
+            sorted_offsets: RefCell::new(None),
         }))
     }
 
+    /// Entry offsets in pack-file order (cached).
+    pub fn sorted_offsets(&self) -> Rc<Vec<u64>> {
+        if let Some(v) = self.sorted_offsets.borrow().as_ref() {
+            return v.clone();
+        }
+        let mut v = self.idx.offsets.clone();
+        v.sort_unstable();
+        let v = Rc::new(v);
+        *self.sorted_offsets.borrow_mut() = Some(v.clone());
+        v
+    }
+
+    /// Byte span [entry_start, entry_end) of the entry at `offset` —
+    /// entries are contiguous, so the end is the next entry's offset
+    /// (or the pack trailer for the last one).
+    pub fn entry_span(&self, offset: u64) -> (usize, usize) {
+        let offs = self.sorted_offsets();
+        let end = match offs.binary_search(&(offset + 1)) {
+            Ok(i) => offs[i],
+            Err(i) if i < offs.len() => offs[i],
+            _ => self.data.len() as u64 - 20, // pack trailer is 20-byte sha1
+        };
+        (offset as usize, end as usize)
+    }
+
+    /// Parse the entry header and report (header, entry_end).
+    pub fn raw_entry(&self, offset: u64) -> Result<(EntryHeader, usize)> {
+        let h = parse_entry_header(&self.data, offset as usize)?;
+        let (_, end) = self.entry_span(offset);
+        Ok((h, end))
+    }
+
     /// Find all entry offsets by scanning a pack buffer.
+    #[allow(dead_code)]
     pub fn scan_entries(pack: &[u8]) -> Result<Vec<u64>> {
         if pack.len() < 12 || &pack[0..4] != b"PACK" {
             return Err(GitError::Parse("bad pack header".into()));
@@ -700,21 +736,36 @@ fn encode_ofs_delta(mut off: u64) -> Vec<u8> {
     bytes
 }
 
-/// Attempt delta compression when writing a pack: each object is tried
-/// against the previous WINDOW objects of the same type; the smallest
-/// delta under half the object's size wins.
-/// Returns (pack_bytes, oids_in_pack_order).
-pub fn write_pack_delta(objects: &[PackObj]) -> (Vec<u8>, Vec<Oid>) {
-    // order: commits first (checkout speed), then trees, blobs, tags;
-    // within a type, larger objects first so they serve as delta bases
-    fn rank(t: ObjType) -> u8 {
-        match t {
-            ObjType::Commit => 0,
-            ObjType::Tree => 1,
-            ObjType::Blob => 2,
-            ObjType::Tag => 3,
-        }
+/// Entry emission plan produced by parallel deltification.
+struct EntryPlan {
+    /// index into `order` of the delta base (same chunk), if delta'd
+    base_pos: Option<usize>,
+    /// uncompressed size that goes in the entry header
+    raw_size: u64,
+    /// is_delta
+    delta: bool,
+    /// deflated body
+    body: Vec<u8>,
+}
+
+/// order: commits first (checkout speed), then trees, blobs, tags;
+/// within a type, larger objects first so they serve as delta bases
+fn type_rank(t: ObjType) -> u8 {
+    match t {
+        ObjType::Commit => 0,
+        ObjType::Tree => 1,
+        ObjType::Blob => 2,
+        ObjType::Tag => 3,
     }
+}
+
+fn rank(t: ObjType) -> u8 {
+    type_rank(t)
+}
+
+/// Phase 1 of pack writing: sort objects and (in parallel) pick delta
+/// bases + deflate entry bodies. Returns (order, plans).
+fn plan_entries(objects: &[PackObj]) -> (Vec<usize>, Vec<EntryPlan>) {
     let mut order: Vec<usize> = (0..objects.len()).collect();
     order.sort_by_key(|&i| {
         (
@@ -727,16 +778,6 @@ pub fn write_pack_delta(objects: &[PackObj]) -> (Vec<u8>, Vec<Oid>) {
     // `git pack-objects --threads`). Each produces deflated entry bodies;
     // headers are encoded serially afterwards because OFS_DELTA distances
     // depend on absolute pack offsets.
-    struct EntryPlan {
-        /// index into `order` of the delta base (same chunk), if delta'd
-        base_pos: Option<usize>,
-        /// uncompressed size that goes in the entry header
-        raw_size: u64,
-        /// is_delta
-        delta: bool,
-        /// deflated body
-        body: Vec<u8>,
-    }
     fn deltify_chunk(objects: &[PackObj], chunk: &[(usize, usize)]) -> Vec<EntryPlan> {
         const WINDOW: usize = 10;
         type Recent = (usize, usize, std::rc::Rc<std::cell::OnceCell<DeltaIndex>>);
@@ -825,35 +866,129 @@ pub fn write_pack_delta(objects: &[PackObj]) -> (Vec<u8>, Vec<Oid>) {
             }
         });
     }
+    (order, plans)
+}
 
-    // Phase 2 (serial): assign pack offsets and encode headers.
+/// Attempt delta compression when writing a pack: each object is tried
+/// against the previous WINDOW objects of the same type; the smallest
+/// delta under half the object's size wins.
+/// Returns (pack_bytes, oids_in_pack_order).
+#[allow(dead_code)]
+pub fn write_pack_delta(objects: &[PackObj]) -> (Vec<u8>, Vec<Oid>) {
+    let (bytes, metas) = write_pack_delta_meta(objects);
+    (bytes, metas.into_iter().map(|(o, _)| o).collect())
+}
+
+/// write_pack_delta + entry offsets — for idx generation without
+/// rescanning the pack.
+pub fn write_pack_delta_meta(objects: &[PackObj]) -> (Vec<u8>, Vec<(Oid, u64)>) {
+    let (order, plans) = plan_entries(objects);
     let mut out = Vec::new();
     out.extend_from_slice(b"PACK");
     out.extend_from_slice(&2u32.to_be_bytes());
     out.extend_from_slice(&(objects.len() as u32).to_be_bytes());
+    let metas = emit_plans(&mut out, objects, &order, &plans);
+    let mut h = Sha1::new();
+    h.update(&out);
+    out.extend_from_slice(&h.finalize());
+    (out, metas)
+}
+
+/// Write a pack mixing reused verbatim entries with freshly deltified
+/// objects — the fast path for repacking already-packed repos (git's
+/// "reuse deltas" mode). `reused` must already be sorted so OFS bases
+/// precede deltas (reusable_entries does this). Fresh objects are
+/// deltified in parallel and emitted after the reused entries.
+/// Returns (pack_bytes, oids_in_pack_order).
+pub fn write_pack_mixed(
+    fresh: &[PackObj],
+    mut reused: Vec<ReuseEntry>,
+) -> Result<(Vec<u8>, Vec<(Oid, u64)>)> {
+    reused.sort_by_key(|e| (e.pack_key, e.src_off));
+    let mut out = Vec::with_capacity(
+        fresh.iter().map(|o| o.data.len() / 2).sum::<usize>() + (1 << 20),
+    );
+    out.extend_from_slice(b"PACK");
+    out.extend_from_slice(&2u32.to_be_bytes());
+    out.extend_from_slice(&((reused.len() + fresh.len()) as u32).to_be_bytes());
+    let mut metas = emit_reused(&mut out, &reused)?;
+    let (order, plans) = plan_entries(fresh);
+    metas.extend(emit_plans(&mut out, fresh, &order, &plans));
+    let mut h = Sha1::new();
+    h.update(&out);
+    out.extend_from_slice(&h.finalize());
+    Ok((out, metas))
+}
+
+/// Serialize previously-deltified plans at the tail of `out`
+/// (which already holds a pack header — and possibly reused entries).
+fn emit_plans(
+    out: &mut Vec<u8>,
+    objects: &[PackObj],
+    order: &[usize],
+    plans: &[EntryPlan],
+) -> Vec<(Oid, u64)> {
     let mut offsets: Vec<u64> = vec![0; order.len()]; // by order position
+    let mut metas = Vec::with_capacity(order.len());
     for (pos, plan) in plans.iter().enumerate() {
         let entry_off = out.len() as u64;
         offsets[pos] = entry_off;
         let oi = order[pos];
+        metas.push((objects[oi].oid, entry_off));
         match plan.base_pos {
             Some(bpos) => {
                 debug_assert!(plan.delta);
-                write_entry_header(&mut out, OBJ_OFS_DELTA, plan.raw_size);
+                write_entry_header(out, OBJ_OFS_DELTA, plan.raw_size);
                 out.extend_from_slice(&encode_ofs_delta(entry_off - offsets[bpos]));
                 out.extend_from_slice(&plan.body);
             }
             None => {
-                write_entry_header(&mut out, obj_type_id(objects[oi].ty), plan.raw_size);
+                write_entry_header(out, obj_type_id(objects[oi].ty), plan.raw_size);
                 out.extend_from_slice(&plan.body);
             }
         }
     }
-    let mut h = Sha1::new();
-    h.update(&out);
-    out.extend_from_slice(&h.finalize());
-    let oids = order.iter().map(|&i| objects[i].oid).collect();
-    (out, oids)
+    metas
+}
+
+/// Emit reused entries (verbatim compressed bytes) at the tail of `out`.
+/// OFS_DELTA entries get their base distance re-encoded against the new
+/// offsets. Entries must be sorted by (pack_key, src_off) so OFS bases
+/// precede their deltas. Returns (oid, offset) pairs in emit order.
+fn emit_reused(out: &mut Vec<u8>, reused: &[ReuseEntry]) -> Result<Vec<(Oid, u64)>> {
+    let mut map: HashMap<(usize, u64), u64> = HashMap::with_capacity(reused.len());
+    let mut metas = Vec::with_capacity(reused.len());
+    for e in reused {
+        let (h, end) = e.pack.raw_entry(e.src_off)?;
+        let entry_off = out.len() as u64;
+        // demote to a fully-resolved object when the delta base wasn't
+        // emitted (reuse invariant broken by caller, or base in a pack
+        // we didn't reuse) — never emit a dangling delta.
+        let demote = h.type_id == OBJ_OFS_DELTA
+            && match h
+                .base_offset
+                .and_then(|b| map.get(&(e.pack_key, b)).copied())
+            {
+                Some(_) => false,
+                None => true,
+            };
+        if demote {
+            let obj = e.pack.read_at(e.src_off, &|_| None)?;
+            write_entry_header(out, obj.0 as u8, obj.1.len() as u64);
+            out.extend_from_slice(&zlib::deflate(&obj.1));
+        } else if h.type_id == OBJ_OFS_DELTA {
+            let base_new = map[&(e.pack_key, h.base_offset.unwrap())];
+            write_entry_header(out, OBJ_OFS_DELTA, h.size);
+            out.extend_from_slice(&encode_ofs_delta(entry_off - base_new));
+            out.extend_from_slice(&e.pack.data[h.data_offset..end]);
+        } else {
+            // full or ref-delta: the whole entry copies verbatim
+            out.extend_from_slice(&e.pack.data[e.src_off as usize..end]);
+        }
+        map.insert((e.pack_key, e.src_off), entry_off);
+        metas.push((e.oid, entry_off));
+    }
+    Ok(metas)
 }
 
 fn write_entry_header(out: &mut Vec<u8>, type_id: u8, mut size: u64) {
@@ -880,6 +1015,93 @@ pub struct PackObj {
     pub oid: Oid,
     pub ty: ObjType,
     pub data: Vec<u8>,
+}
+
+/// A pack entry reused verbatim from an existing pack — the compressed
+/// payload (and for full entries the whole entry) is copied unchanged;
+/// only OFS_DELTA base offsets are re-encoded for the new positions.
+pub struct ReuseEntry {
+    pub oid: Oid,
+    /// source pack identity (Rc pointer) + entry offset within it
+    pub pack_key: usize,
+    pub pack: Rc<Pack>,
+    pub src_off: u64,
+}
+
+/// Decide which entries of `pack` (offsets given) can be reused verbatim
+/// in a new pack containing `wanted` oids. Returns (reusable, fallback)
+/// entry lists. Reuse rules:
+///   - full entries: always reusable
+///   - REF_DELTA: reusable iff the base oid is also wanted
+///   - OFS_DELTA: reusable iff its base chain is reusable in the same pack
+pub fn reusable_entries(
+    pack: &Rc<Pack>,
+    entries: &[(Oid, u64)], // (oid, src offset) wanted from this pack
+    wanted: &std::collections::HashSet<Oid>,
+) -> (Vec<ReuseEntry>, Vec<Oid>) {
+    let key = Rc::as_ptr(pack) as usize;
+    let mut memo: HashMap<u64, bool> = HashMap::new();
+    let src_wanted: std::collections::HashSet<u64> =
+        entries.iter().map(|&(_, off)| off).collect();
+    // does the delta chain rooted at src_off resolve to reusable bases?
+    // an OFS base is reusable only if it is itself one of the wanted
+    // entries (we cannot leave a dangling offset in the new pack).
+    fn chain_ok(
+        pack: &Pack,
+        start: u64,
+        memo: &mut HashMap<u64, bool>,
+        wanted: &std::collections::HashSet<Oid>,
+        src_wanted: &std::collections::HashSet<u64>,
+    ) -> bool {
+        let mut visited = Vec::new();
+        let mut off = start;
+        let ok = loop {
+            if let Some(&v) = memo.get(&off) {
+                break v;
+            }
+            if visited.len() > 4000 {
+                break false; // pathological chain — treat as fresh
+            }
+            visited.push(off);
+            let h = match pack.raw_entry(off) {
+                Ok((h, _)) => h,
+                Err(_) => break false,
+            };
+            match h.type_id {
+                OBJ_OFS_DELTA => match h.base_offset {
+                    Some(b) if b < off && src_wanted.contains(&b) => off = b,
+                    _ => break false,
+                },
+                OBJ_REF_DELTA => {
+                    break h.base_oid.map(|b| wanted.contains(&b)).unwrap_or(false)
+                }
+                1..=4 => break true,
+                _ => break false,
+            }
+        };
+        for v in visited {
+            memo.insert(v, ok);
+        }
+        ok
+    }
+    let mut good = Vec::new();
+    let mut rest = Vec::new();
+    // emit order = source pack order → OFS bases precede their deltas
+    let mut sorted: Vec<(Oid, u64)> = entries.to_vec();
+    sorted.sort_by_key(|&(_, off)| off);
+    for (oid, off) in sorted {
+        if chain_ok(pack, off, &mut memo, wanted, &src_wanted) {
+            good.push(ReuseEntry {
+                oid,
+                pack_key: key,
+                pack: pack.clone(),
+                src_off: off,
+            });
+        } else {
+            rest.push(oid);
+        }
+    }
+    (good, rest)
 }
 
 /// Write a pack v2 containing full (non-delta) objects. Returns (pack_bytes, entries_meta)
@@ -917,6 +1139,7 @@ pub fn write_pack(objects: &[PackObj]) -> Vec<u8> {
 
 /// Write idx v2 for `pack_bytes` + `objects` (oids in the same order they
 /// were written to the pack — we recompute offsets by scanning).
+#[allow(dead_code)]
 pub fn write_idx(pack_bytes: &[u8], oids: &[Oid]) -> Result<Vec<u8>> {
     let offsets = Pack::scan_entries(pack_bytes)?;
     write_idx_offsets(pack_bytes, oids, &offsets)
@@ -1014,11 +1237,23 @@ pub fn store_pack_bytes(
     Ok(name)
 }
 
+/// Mixed fresh+reused variant of store_pack — reuse path for repacking.
+pub fn store_pack_mixed(
+    dir: &Path,
+    fresh: &[PackObj],
+    reused: Vec<ReuseEntry>,
+) -> Result<String> {
+    let (pack_bytes, metas) = write_pack_mixed(fresh, reused)?;
+    let (oids, offsets): (Vec<Oid>, Vec<u64>) = metas.into_iter().unzip();
+    store_pack_bytes(dir, &pack_bytes, &oids, &offsets)
+}
+
 /// Write a pack + idx into `dir` (e.g. .git/objects/pack). Returns the
 /// generated file base name.
 pub fn store_pack(dir: &Path, objects: &[PackObj]) -> Result<String> {
-    let (pack_bytes, oids) = write_pack_delta(objects);
-    let idx_bytes = write_idx(&pack_bytes, &oids)?;
+    let (pack_bytes, metas) = write_pack_delta_meta(objects);
+    let (oids, offsets): (Vec<Oid>, Vec<u64>) = metas.into_iter().unzip();
+    let idx_bytes = write_idx_offsets(&pack_bytes, &oids, &offsets)?;
     let hash = &pack_bytes[pack_bytes.len() - 20..];
     let name = format!("pack-{}", crate::util::to_hex(hash));
     std::fs::create_dir_all(dir)?;

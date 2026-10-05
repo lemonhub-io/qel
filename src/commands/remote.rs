@@ -136,18 +136,31 @@ fn clone_local_shallow(
     let d = depth.unwrap_or(0).max(1);
     let boundary = protocol::shallow_boundary(&src_repo, &tips, d)?;
     let boundary_set: HashSet<Oid> = boundary.iter().copied().collect();
-    // copy objects for commits within depth
-    let mut objects: HashSet<Oid> = HashSet::new();
-    for oid in revwalk::reachable_objects(&src_repo, &tips)? {
-        // drop commits below the boundary (they're not in this repo's copy)
-        objects.insert(oid);
-    }
-    // remove commits strictly below the boundary
+    // objects strictly below the boundary
+    let mut below: HashSet<Oid> = HashSet::new();
     for b in &boundary {
         if let Ok(c) = revwalk::load_commit(&src_repo, b) {
             for p in &c.parents {
-                for o in revwalk::reachable_objects(&src_repo, &[*p])? {
-                    objects.remove(&o);
+                below.extend(revwalk::reachable_objects(&src_repo, &[*p])?);
+            }
+        }
+    }
+    // kept set = in-depth commits + each one's full tree closure.
+    // Never subtract `below` blindly: subtrees shared between boundary
+    // and older commits would be removed while still referenced.
+    let mut objects: HashSet<Oid> = HashSet::new();
+    for oid in revwalk::reachable_objects(&src_repo, &tips)? {
+        if below.contains(&oid) {
+            continue;
+        }
+        if let Some(o) = src_repo.odb.read_opt(&oid)? {
+            if o.0 == ObjType::Commit {
+                objects.insert(oid);
+                if let Ok(c) = crate::object::Commit::parse(&o.1) {
+                    objects.extend(revwalk::reachable_objects(
+                        &src_repo,
+                        &[c.tree],
+                    )?);
                 }
             }
         }
@@ -1349,7 +1362,11 @@ fn cmd_daemon(args: &[String]) -> Result<i32> {
                 let dirs = dirs.clone();
                 let enabled = enabled.clone();
                 std::thread::spawn(move || {
-                    let _ = serve_daemon_conn(s, base, dirs, export_all, enabled);
+                    if let Err(e) =
+                        serve_daemon_conn(s, base, dirs, export_all, enabled)
+                    {
+                        eprintln!("qel daemon: connection error: {}", e);
+                    }
                 });
             }
             Err(e) => eprintln!("accept error: {}", e),

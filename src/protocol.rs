@@ -874,26 +874,14 @@ pub fn build_pack_for_push(
             ObjType::Blob => {}
         }
     }
-    // deterministic order: commits, then trees, then blobs, then tags
-    let mut ordered: Vec<PackObj> = Vec::new();
-    let mut sorted: Vec<Oid> = need.into_iter().collect();
-    sorted.sort();
-    for ty in [ObjType::Commit, ObjType::Tree, ObjType::Blob, ObjType::Tag] {
-        for o in &sorted {
-            let obj = repo.odb.read(o)?;
-            if obj.0 == ty {
-                ordered.push(PackObj {
-                    oid: *o,
-                    ty,
-                    data: obj.1.clone(),
-                });
-            }
-        }
-    }
+    // reuse existing pack entries verbatim where possible (deltified
+    // only for loose/fallback objects)
+    let want: Vec<Oid> = need.into_iter().collect();
+    let (reused, fresh) = repo.odb.pack_inputs(&want)?;
     // The protocol requires a pack whenever any update has a non-zero
     // new value — even when it contains zero objects. An empty vec here
     // would deadlock a server waiting to parse PACK data.
-    Ok(crate::pack::write_pack_delta(&ordered).0)
+    Ok(crate::pack::write_pack_mixed(&fresh, reused)?.0)
 }
 
 // ============================== protocol v2 ==============================
@@ -1293,8 +1281,51 @@ pub fn shallow_boundary(repo: &Repo, wants: &[Oid], depth: u32) -> Result<Vec<Oi
     Ok(boundary)
 }
 
+/// Absolute depth for a `deepen` request: relative deepens measure from
+/// the client's current shallow boundary (BFS level where the client's
+/// shallow commits sit, +1 for that level's own depth).
+fn deepen_depth(
+    repo: &Repo,
+    wants: &[Oid],
+    client_shallow: &HashSet<Oid>,
+    deepen: u32,
+    relative: bool,
+) -> Result<u32> {
+    if !relative || client_shallow.is_empty() {
+        return Ok(deepen);
+    }
+    let mut remaining: HashSet<Oid> = client_shallow.clone();
+    let mut seen: HashSet<Oid> = HashSet::new();
+    let mut level: Vec<Oid> = wants.to_vec();
+    let mut d = 0u32;
+    while !level.is_empty() && !remaining.is_empty() {
+        let mut next = Vec::new();
+        for oid in &level {
+            if !seen.insert(*oid) {
+                continue;
+            }
+            remaining.remove(oid);
+            if let Ok(c) = crate::revwalk::load_commit(repo, oid) {
+                next.extend(c.parents.iter().copied());
+            }
+        }
+        d += 1;
+        level = next;
+    }
+    // boundary commits sit at level depth-1; the new absolute depth is
+    // (level of old boundary + 1) + deepen
+    Ok(d + deepen)
+}
+
 /// Objects for a depth-limited pack: closure of wants truncated at `depth`.
-fn build_pack_shallow(repo: &Repo, wants: &[Oid], remote_tips: &[Oid], depth: u32) -> Result<Vec<u8>> {
+fn build_pack_shallow(
+    repo: &Repo,
+    wants: &[Oid],
+    remote_tips: &[Oid],
+    depth: u32,
+    client_shallow: &[Oid],
+) -> Result<Vec<u8>> {
+    let client_shallow_set: HashSet<Oid> = client_shallow.iter().copied().collect();
     // commits within depth (inclusive)
     let mut included: HashSet<Oid> = HashSet::new();
     let mut level: Vec<Oid> = wants.to_vec();
@@ -1312,10 +1343,16 @@ fn build_pack_shallow(repo: &Repo, wants: &[Oid], remote_tips: &[Oid], depth: u3
         d += 1;
         level = next;
     }
-    // excluded tips = remote_tips + parents of boundary commits
+    // excluded tips = remote_tips + parents of boundary commits. The
+    // remote is shallow: don't walk below ITS boundary — objects under
+    // client_shallow commits are not on the client.
     let mut remote_have: HashSet<Oid> = HashSet::new();
     for t in remote_tips {
-        for o in crate::revwalk::reachable_objects(repo, &[*t])? {
+        for o in crate::revwalk::reachable_objects_if(
+            repo,
+            &[*t],
+            &|o| client_shallow_set.contains(o),
+        )? {
             remote_have.insert(o);
         }
     }
@@ -1363,27 +1400,20 @@ fn build_pack_shallow(repo: &Repo, wants: &[Oid], remote_tips: &[Oid], depth: u3
             ObjType::Blob => {}
         }
     }
-    let mut ordered = Vec::new();
-    let mut sorted: Vec<Oid> = need.into_iter().collect();
-    sorted.sort();
-    for ty in [ObjType::Commit, ObjType::Tree, ObjType::Blob, ObjType::Tag] {
-        for o in &sorted {
-            let obj = repo.odb.read(o)?;
-            if obj.0 == ty {
-                ordered.push(PackObj { oid: *o, ty, data: obj.1.clone() });
-            }
-        }
-    }
-    if ordered.is_empty() {
+    let want: Vec<Oid> = need.into_iter().collect();
+    let (reused, fresh) = repo.odb.pack_inputs(&want)?;
+    if reused.is_empty() && fresh.is_empty() {
         return Ok(Vec::new());
     }
-    Ok(crate::pack::write_pack_delta(&ordered).0)
+    Ok(crate::pack::write_pack_mixed(&fresh, reused)?.0)
 }
 
 fn serve_v2_fetch(repo: &Repo, args: &[String], w: &mut dyn Write) -> Result<()> {
     let mut wants = Vec::new();
     let mut haves = Vec::new();
     let mut deepen: Option<u32> = None;
+    let mut deepen_relative = false;
+    let mut unshallow_arg = false;
     let mut client_shallow: Vec<Oid> = Vec::new();
     let mut sideband_all = false;
     for a in args {
@@ -1399,17 +1429,24 @@ fn serve_v2_fetch(repo: &Repo, args: &[String], w: &mut dyn Write) -> Result<()>
             }
         } else if let Some(s) = a.strip_prefix("deepen ") {
             deepen = s.parse().ok();
+        } else if a == "deepen-relative" {
+            deepen_relative = true;
+        } else if a == "unshallow" {
+            unshallow_arg = true;
         } else if let Some(s) = a.strip_prefix("shallow ") {
             if let Ok(o) = Oid::from_hex(s) {
                 client_shallow.push(o);
             }
         }
     }
+    let client_shallow_set: HashSet<Oid> = client_shallow.iter().copied().collect();
+    let deepen_abs = deepen
+        .map(|d| deepen_depth(repo, &wants, &client_shallow_set, d, deepen_relative))
+        .transpose()?;
     let mut shallow_lines: Vec<Oid> = Vec::new();
-    if let Some(d) = deepen {
+    if let Some(d) = deepen_abs {
         shallow_lines = shallow_boundary(repo, &wants, d)?;
     }
-    let _ = client_shallow;
     // acknowledgments (only when the client sent haves)
     let haves_known: Vec<Oid> = haves
         .iter()
@@ -1424,21 +1461,42 @@ fn serve_v2_fetch(repo: &Repo, args: &[String], w: &mut dyn Write) -> Result<()>
         w.write_all(&pktline::encode_str("ready\n"))?;
         w.write_all(b"0001")?;
     }
-    if !shallow_lines.is_empty() {
+    // commits whose boundary moved deeper (or lifted entirely via
+    // `unshallow`) must be reported as unshallow or the client keeps
+    // truncating history at the old boundary
+    let mut unshallow_lines: Vec<Oid> = Vec::new();
+    if unshallow_arg {
+        unshallow_lines.extend(client_shallow.iter().copied());
+    } else if deepen_abs.is_some() {
+        unshallow_lines.extend(
+            client_shallow
+                .iter()
+                .filter(|o| !shallow_lines.contains(o))
+                .copied(),
+        );
+    }
+    if !shallow_lines.is_empty() || !unshallow_lines.is_empty() {
         w.write_all(&pktline::encode_str("shallow-info\n"))?;
         for o in &shallow_lines {
             w.write_all(&pktline::encode_str(&format!("shallow {}\n", o.hex())))?;
         }
+        for o in &unshallow_lines {
+            w.write_all(&pktline::encode_str(&format!("unshallow {}\n", o.hex())))?;
+        }
         w.write_all(b"0001")?;
     }
     let remote_tips: &[Oid] = if haves_known.is_empty() { &[] } else { &haves_known };
-    let pack = match deepen {
-        Some(d) => build_pack_shallow(repo, &wants, remote_tips, d)?,
+    let pack = match deepen_abs {
+        Some(d) => build_pack_shallow(repo, &wants, remote_tips, d, &client_shallow)?,
         None => build_pack_for_push(repo, &wants, remote_tips)?,
     };
-    w.write_all(&pktline::encode_str("packfile\n"))?;
     let _ = sideband_all; // packfile content is band-1 either way in v2
-    write_band1(w, &pack)?;
+    if pack.is_empty() {
+        w.write_all(pktline::FLUSH)?;
+    } else {
+        w.write_all(&pktline::encode_str("packfile\n"))?;
+        write_band1(w, &pack)?;
+    }
     Ok(())
 }
 
@@ -1536,6 +1594,7 @@ const SERVER_CAPS_UPLOAD: &[&str] = &[
     "no-progress",
     "include-tag",
     "shallow",
+    "deepen-relative",
     "object-format=sha1",
     "agent=qel/0.1",
 ];
@@ -1770,6 +1829,7 @@ pub fn serve_upload_pack_stateless(repo: &Repo, r: &mut dyn Read, w: &mut dyn Wr
     let mut wants: Vec<Oid> = Vec::new();
     let mut client_caps: HashSet<String> = HashSet::new();
     let mut deepen: Option<u32> = None;
+    let mut deepen_relative = false;
     let mut client_shallow: Vec<Oid> = Vec::new();
     loop {
         let line = match pktline::read(r)? {
@@ -1801,6 +1861,8 @@ pub fn serve_upload_pack_stateless(repo: &Repo, r: &mut dyn Read, w: &mut dyn Wr
             if let Ok(o) = Oid::from_hex(sha) {
                 client_shallow.push(o);
             }
+        } else if s == "deepen-relative" {
+            deepen_relative = true;
         } else if s == "deepen" || s.starts_with("deepen-since")
             || s.starts_with("deepen-not") || s == "unshallow"
         {
@@ -1811,6 +1873,28 @@ pub fn serve_upload_pack_stateless(repo: &Repo, r: &mut dyn Read, w: &mut dyn Wr
     }
     if wants.is_empty() {
         return Ok(());
+    }
+    // in v0, deepen-relative arrives as a *capability* on the want line
+    // (the client only sends a bare `deepen N` count line)
+    deepen_relative = deepen_relative || client_caps.contains("deepen-relative");
+    // shallow boundary report: for depth requests the client waits for
+    // our shallow/unshallow lines *before* sending haves — send them now
+    let client_shallow_set: HashSet<Oid> = client_shallow.iter().copied().collect();
+    let deepen_abs = deepen
+        .map(|d| deepen_depth(repo, &wants, &client_shallow_set, d, deepen_relative))
+        .transpose()?;
+    if let Some(d) = deepen_abs {
+        let shallow_lines = shallow_boundary(repo, &wants, d)?;
+        for o in &shallow_lines {
+            w.write_all(&pktline::encode_str(&format!("shallow {}\n", o.hex())))?;
+        }
+        for o in &client_shallow {
+            if repo.odb.has(o) && !shallow_lines.contains(o) {
+                w.write_all(&pktline::encode_str(&format!("unshallow {}\n", o.hex())))?;
+            }
+        }
+        w.write_all(pktline::FLUSH)?;
+        w.flush()?;
     }
     // haves until "done"
     let mut haves_known: Vec<Oid> = Vec::new();
@@ -1849,21 +1933,6 @@ pub fn serve_upload_pack_stateless(repo: &Repo, r: &mut dyn Read, w: &mut dyn Wr
             w.write_all(&pktline::encode_str("NAK\n"))?;
         }
     }
-    // shallow boundary report (v0): emitted before the pack when the
-    // client requested a depth limit
-    if let Some(d) = deepen {
-        let shallow_lines = shallow_boundary(repo, &wants, d)?;
-        for o in &shallow_lines {
-            w.write_all(&pktline::encode_str(&format!("shallow {}\n", o.hex())))?;
-        }
-        // boundary commits the client already has become unshallow when
-        // we now cover their parents
-        for o in &client_shallow {
-            if repo.odb.has(o) && !shallow_lines.contains(o) {
-                w.write_all(&pktline::encode_str(&format!("unshallow {}\n", o.hex())))?;
-            }
-        }
-    }
     // if we couldn't ACK, the pack must be the full closure of wants —
     // excluding client haves is only legal after an ACK.
     let remote_tips: &[Oid] = if last_common.is_some() && can_ack {
@@ -1871,8 +1940,8 @@ pub fn serve_upload_pack_stateless(repo: &Repo, r: &mut dyn Read, w: &mut dyn Wr
     } else {
         &[]
     };
-    let pack = match deepen {
-        Some(d) => build_pack_shallow(repo, &wants, remote_tips, d)?,
+    let pack = match deepen_abs {
+        Some(d) => build_pack_shallow(repo, &wants, remote_tips, d, &client_shallow)?,
         None => build_pack_for_push(repo, &wants, remote_tips)?,
     };
     if client_caps.contains("side-band-64k") {
@@ -1882,7 +1951,7 @@ pub fn serve_upload_pack_stateless(repo: &Repo, r: &mut dyn Read, w: &mut dyn Wr
         } else {
             write_band1(w, &pack)?;
         }
-    } else {
+    } else if !pack.is_empty() {
         w.write_all(&pack)?;
         w.flush()?;
     }

@@ -5,9 +5,38 @@ use crate::pack::Pack;
 use crate::util::{to_hex, GitError, Result};
 use crate::zlib;
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+
+/// Where an object lives on disk — for verbatim pack-entry reuse.
+pub enum ObjLoc {
+    Loose,
+    Packed(Rc<Pack>, u64),
+}
+
+/// Read an object from any of `stores` (loose first, then packs, with
+/// cross-store REF-delta resolution). Free fn so worker threads can use
+/// it without an Odb.
+fn read_opt_in(
+    stores: &[Store],
+    oid: &Oid,
+) -> Result<Option<Rc<(ObjType, Vec<u8>)>>> {
+    for store in stores {
+        if let Some(o) = store.read_loose(oid)? {
+            return Ok(Some(o));
+        }
+    }
+    for store in stores {
+        for pack in store.packs() {
+            let resolve = |o: &Oid| read_opt_in(stores, o).ok().flatten();
+            if let Some(obj) = pack.read_object(oid, &resolve)? {
+                return Ok(Some(obj));
+            }
+        }
+    }
+    Ok(None)
+}
 
 pub struct Store {
     pub dir: PathBuf,
@@ -167,20 +196,7 @@ impl Odb {
     }
 
     pub fn read_opt(&self, oid: &Oid) -> Result<Option<Rc<(ObjType, Vec<u8>)>>> {
-        for store in &self.stores {
-            if let Some(o) = store.read_loose(oid)? {
-                return Ok(Some(o));
-            }
-        }
-        for store in &self.stores {
-            for pack in store.packs() {
-                let resolve = |o: &Oid| self.read_opt(o).ok().flatten();
-                if let Some(obj) = pack.read_object(oid, &resolve)? {
-                    return Ok(Some(obj));
-                }
-            }
-        }
-        Ok(None)
+        read_opt_in(&self.stores, oid)
     }
 
     /// Read only the header: (type, size). Still decompresses, but avoids
@@ -190,6 +206,111 @@ impl Odb {
     pub fn read_header(&self, oid: &Oid) -> Result<(ObjType, usize)> {
         let obj = self.read(oid)?;
         Ok((obj.0, obj.1.len()))
+    }
+
+    /// Where does an object live? Loose file or (pack, entry offset) —
+    /// without inflating anything. Used by pack-reuse fast paths.
+    pub fn locate(&self, oid: &Oid) -> Option<ObjLoc> {
+        for store in &self.stores {
+            if store.loose_path(oid).exists() {
+                return Some(ObjLoc::Loose);
+            }
+        }
+        for store in &self.stores {
+            for pack in store.packs() {
+                if let Some(off) = pack.find_offset(oid) {
+                    return Some(ObjLoc::Packed(pack, off));
+                }
+            }
+        }
+        None
+    }
+
+    /// Split wanted oids into verbatim-reusable pack entries and fresh
+    /// objects needing deltification (git's "reuse deltas" fast path).
+    pub fn pack_inputs(
+        &self,
+        oids: &[Oid],
+    ) -> Result<(Vec<crate::pack::ReuseEntry>, Vec<crate::pack::PackObj>)> {
+        let wanted: HashSet<Oid> = oids.iter().copied().collect();
+        // group located entries per source pack (keyed by Rc identity)
+        let mut by_pack: Vec<(Rc<Pack>, Vec<(Oid, u64)>)> = Vec::new();
+        let mut pack_pos: HashMap<usize, usize> = HashMap::new();
+        let mut loose: Vec<Oid> = Vec::new();
+        for oid in oids {
+            match self.locate(oid) {
+                Some(ObjLoc::Packed(pack, off)) => {
+                    let k = Rc::as_ptr(&pack) as usize;
+                    match pack_pos.get(&k) {
+                        Some(&i) => by_pack[i].1.push((*oid, off)),
+                        None => {
+                            pack_pos.insert(k, by_pack.len());
+                            by_pack.push((pack, vec![(*oid, off)]));
+                        }
+                    }
+                }
+                Some(ObjLoc::Loose) | None => loose.push(*oid),
+            }
+        }
+        let mut reused = Vec::new();
+        let mut fallback = Vec::new();
+        for (pack, entries) in by_pack {
+            let (good, rest) = crate::pack::reusable_entries(&pack, &entries, &wanted);
+            reused.extend(good);
+            fallback.extend(rest);
+        }
+        // everything not reused needs its data (parallel over chunks)
+        let fresh_oids: Vec<Oid> = loose.into_iter().chain(fallback).collect();
+        let fresh = self.read_many(&fresh_oids)?;
+        Ok((reused, fresh))
+    }
+
+    /// Read many objects, parallelized across threads by chunking the oid
+    /// list (each worker opens its own Pack handles — Rc isn't Send).
+    pub fn read_many(&self, oids: &[Oid]) -> Result<Vec<crate::pack::PackObj>> {
+        use crate::pack::PackObj;
+        let n = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(8)
+            .min(oids.len().max(1));
+        if n <= 1 {
+            let mut v = Vec::with_capacity(oids.len());
+            for oid in oids {
+                let o = self.read(oid)?;
+                v.push(PackObj { oid: *oid, ty: o.0, data: o.1.clone() });
+            }
+            return Ok(v);
+        }
+        let chunk = (oids.len() + n - 1) / n;
+        let mut out: Vec<PackObj> = Vec::new();
+        std::thread::scope(|s| {
+            let handles: Vec<_> = oids
+                .chunks(chunk)
+                .map(|slice| {
+                    let dirs: Vec<PathBuf> =
+                        self.stores.iter().map(|s| s.dir.clone()).collect();
+                    s.spawn(move || {
+                        // fresh Stores per thread — independent Pack handles
+                        let stores: Vec<Store> =
+                            dirs.into_iter().map(Store::new).collect();
+                        let mut v = Vec::with_capacity(slice.len());
+                        for oid in slice {
+                            let o = read_opt_in(&stores, oid)?.ok_or_else(|| {
+                                GitError::NotFound(format!("object {} not found", oid))
+                            })?;
+                            v.push(PackObj { oid: *oid, ty: o.0, data: o.1.clone() });
+                        }
+                        Ok::<_, GitError>(v)
+                    })
+                })
+                .collect();
+            for h in handles {
+                out.extend(h.join().expect("read_many thread panicked")?);
+            }
+            Ok::<_, GitError>(())
+        })?;
+        Ok(out)
     }
 
     pub fn has(&self, oid: &Oid) -> bool {
@@ -267,11 +388,31 @@ impl Odb {
     pub fn store_pack(&self, objects: &[crate::pack::PackObj]) -> Result<String> {
         let dir = self.primary_dir().join("pack");
         let name = crate::pack::store_pack(&dir, objects)?;
-        // reset pack cache so new pack is visible
+        self.reset_pack_cache();
+        Ok(name)
+    }
+
+    /// Drop cached pack handles so newly written packs become visible.
+    pub fn reset_pack_cache(&self) {
         for store in &self.stores {
             *store.packs.borrow_mut() = None;
         }
-        Ok(name)
+    }
+
+    /// Pack-creation fast path: reuse packed entries verbatim, deltify
+    /// only loose/fallback objects, store with idx, reset cache.
+    pub fn store_pack_inputs(
+        &self,
+        oids: &[Oid],
+    ) -> Result<Option<String>> {
+        let (reused, fresh) = self.pack_inputs(oids)?;
+        if reused.is_empty() && fresh.is_empty() {
+            return Ok(None);
+        }
+        let dir = self.primary_dir().join("pack");
+        let name = crate::pack::store_pack_mixed(&dir, &fresh, reused)?;
+        self.reset_pack_cache();
+        Ok(Some(name))
     }
 
     /// Loose-object hex for an oid string like "ab12..." -> path

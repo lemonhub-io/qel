@@ -20,15 +20,43 @@ All notable changes to qel are documented here. The format follows
   connection pool across the info/refs + POST sequence, env proxy
   support, redirects. Credentials are sent as an `Authorization` header;
   the temp-netrc dance is gone. No `curl` binary or OpenSSL required.
+- **`--deepen`/`--unshallow` fetch now works in both directions**:
+  server-side shallow negotiation was fixed end-to-end (v0 sends
+  `shallow`/`unshallow` lines before the have-exchange as the protocol
+  requires, `deepen-relative` is honored in v0 + v2, the client's own
+  shallow boundary prunes remote-haves so below-boundary objects are
+  correctly resent, and an empty result no longer emits a malformed
+  packfile section). `git fetch --deepen`/`--unshallow` against
+  `qel daemon` verified on v0 and v2. `deepen-relative` is advertised
+  in v0 capabilities.
 - Write batching on all streaming conns (git://, ssh://): pkt-line
   writes buffer and flush before each read, collapsing one syscall per
   pkt-line into one per negotiation round.
 - `ls-remote` accepts ref patterns after the remote (`ls-remote origin
   HEAD` filters correctly) — previously every positional arg overwrote
   the remote name.
+- Local-path `clone --depth` no longer drops subtrees shared between
+  the boundary and deeper history — the old "remove everything below
+  the boundary" pass deleted objects the boundary commits still
+  reference, leaving checkouts broken. The kept set is now computed as
+  in-depth commits + each one's full tree closure.
+- Daemon connection errors are now logged instead of silently dropped.
 
 ### Changed
 
+- **Pack-entry reuse** (the big `pack-objects` lever): objects already
+  stored in a pack are copied *verbatim* — compressed delta payloads and
+  all — into the output, with only OFS-delta base distances re-encoded
+  for their new offsets. Repacking a packed repository no longer
+  inflates, delta-searches, or re-deflates anything. Applies to
+  `pack-objects`, `gc`, `repack`-style repacks, the upload-pack fetch
+  builder, and the push pack builder. OFS chains are reused only when
+  the whole chain is selected; REF deltas only when the base oid is in
+  the output set; anything else falls back to fresh loading +
+  deltification (loose objects, alternates, missing/malformed entries,
+  demoted chains — never a dangling delta). Measured: ~410 ms vs git's
+  ~390 ms on a 1,446-object packed repo (was ~1 s before; git fresh
+  deltify ~1.5 s), and ~15 ms on a 360-object delta-rich pack.
 - **Parallel `pack-objects`**: deltification is split across threads
   (per-thread delta windows over size-balanced chunks, same scheme as
   `git --threads`) — ~1.0 s vs 1.4 s single-threaded on the benchmark
