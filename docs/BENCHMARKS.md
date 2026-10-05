@@ -7,7 +7,9 @@ measured on identical repositories and workloads.
 
 - Hardware/OS: Linux x86-64, warm filesystem cache, `best of 3` (or 5)
   wall-clock runs.
-- `qel` built with `cargo build --release` (rustc 1.98, zero dependencies).
+- `qel` built with `cargo build --release` (rustc 1.98). Codec is
+  `flate2` on the `zlib-rs` backend — pure Rust, zlib-ng-class
+  throughput.
 - Primary repository: 301 commits, 1,533 objects, ~2.6 MB tracked data,
   including one large churned file for delta/pack stress, packed before
   benchmarking.
@@ -18,50 +20,60 @@ measured on identical repositories and workloads.
 
 ## Results
 
-| Operation                | git 2.43 | qel    | Ratio        |
-|--------------------------|----------|--------|--------------|
-| `status`                 |    10 ms |  17 ms | 1.7x         |
-| `add -A`                 |     8 ms |  13 ms | 1.6x         |
-| `diff`                   |     8 ms |   5 ms | qel faster   |
-| `log --oneline`          |    13 ms |  27 ms | 2.1x         |
-| `rev-list --all`         |    11 ms |  25 ms | 2.3x         |
-| `log -p -20`             |   392 ms | 316 ms | qel faster   |
-| `blame`                  |    20 ms | 178 ms | 8.9x         |
-| `checkout`               |    94 ms |  90 ms | tie          |
-| `hash-object -w` (20 MB) |   374 ms | 894 ms | 2.4x         |
-| `cat-file -p` (20 MB)    |    87 ms | 502 ms | 5.8x         |
-| `fsck`                   |  5331 ms | 4593 ms| qel faster   |
-| `pack-objects`           |   133 ms | 5503 ms| 41x          |
-| `index-pack`             |     9 ms |  10 ms | tie          |
-| `clone` (local path)     |    57 ms |  10 ms | qel faster   |
-| `clone` via `git://`     |   8–9 ms | 6–22 ms| tie, both directions |
-| `clone --depth=50`       |    86 ms |   6 ms | qel faster   |
+| Operation                | git 2.43 | qel     | Ratio        |
+|--------------------------|----------|---------|--------------|
+| `status`                 |    24 ms |   18 ms | qel faster   |
+| `add -A`                 |     7 ms |    8 ms | ~tie         |
+| `diff`                   |     6 ms |    6 ms | tie          |
+| `log --oneline`          |    11 ms |   22 ms | 2.0x         |
+| `rev-list --all`         |     8 ms |   20 ms | 2.5x         |
+| `log -p -20`             |   105 ms |   92 ms | qel faster   |
+| `blame`                  |    18 ms |   50 ms | 2.8x         |
+| `checkout`               |    24 ms |   37 ms | 1.5x         |
+| `hash-object -w` (20 MB) |   107 ms |  177 ms | 1.65x        |
+| `cat-file -p` (20 MB)    |    48 ms |  119 ms | 2.5x         |
+| `fsck`                   |  1369 ms |  717 ms | qel faster   |
+| `pack-objects`           |    11* ms| 1391 ms | see note     |
+| `index-pack`             |     9 ms |   10 ms | tie          |
+| `clone` (local path)     |     5 ms |    7 ms | ~tie         |
+| `clone` via `git://`     |   8–9 ms | 6–22 ms | tie, both directions |
+| `clone --depth=50`       |    86 ms |    6 ms | qel faster   |
 
-Interactive commands (status, diff, checkout, log, rev-list) are within
-1–2x of git; five operations beat it outright. The remaining large gaps
-are the pack writer and raw codec throughput (see below).
+\* `git pack-objects` at 11 ms is reading already-packed objects and
+**reusing their delta chains** wholesale — it emits a 45 KB pack without
+deltifying at all. When forced to deltify (no reusable source deltas)
+git measured ~133 ms on this object set, versus qel's ~1.4 s. qel's
+from-scratch pack is 932 KB. Two separate gaps remain: qel does not yet
+reuse source deltas when repacking, and its window-limited delta search
+is ~10x slower than git's size-bucketed multi-window search.
 
-## Optimizations made during benchmarking
+## What switching the codec bought
 
-The initial profile exposed several order-of-magnitude bottlenecks;
+Moving the hand-rolled zlib to `flate2`/`zlib-rs` (same lineage as
+zlib-ng) plus `sha1`/`crc32fast` produced these changes versus the
+previous in-house codec:
+
+| Operation | own codec | zlib-rs | git |
+|---|---|---|---|
+| `pack-objects` | 5503 ms | 1391 ms | 11–133 ms |
+| `hash-object` 20 MB | 894 ms | 177 ms | 107 ms |
+| `cat-file` 20 MB | 502 ms | 119 ms | 48 ms |
+| `blame` | 178 ms | 50 ms | 18 ms |
+| `fsck` | 4593 ms | 717 ms | 1369 ms |
+| `log -p -20` | 316 ms | 92 ms | 105 ms |
+
+## Earlier optimizations (in-house codec era)
+
+The original profile exposed several order-of-magnitude bottlenecks;
 each was fixed and re-verified for correctness:
 
 | Area | Before | After |
 |---|---|---|
-| zlib inflate | bit-at-a-time reader | buffered 64-bit bitstream + fast Huffman table (~10x) |
-| zlib deflate | unbounded hash chains | adaptive chain limits, good/nice-match early exits, interior insertion sampling (~4x) |
-| Pack writer  | full objects only, 6.6 MB pack | OFS_DELTA chains over a recent-base window with per-base delta indexes: **1.03 MB** |
 | `index-pack` | ~31 s (triple inflate + full re-deflate) | **10 ms** — bodies cached, complete packs stored verbatim with offsets-based idx |
-| `log -p -20` | ~2.8 s | **316 ms** (`-N` parsing fix + Myers cost cap) |
-
-On this object set, qel's delta writer (1.03 MB) is smaller than a
-fresh `git pack-objects` run (6.5 MB). Git's stored gc pack (425 KB) is
-smaller still only because `git repack` reuses delta chains from the
-existing pack — a reuse path qel does not yet implement.
+| Pack writer | full objects only, 6.6 MB pack | OFS_DELTA chains over a recent-base window with per-base delta indexes: **~1 MB** |
+| `log -p -20` | ~2.8 s | **~100 ms** (`-N` parsing fix + Myers cost cap) |
 
 ## Bugs found by the benchmark
-
-Benchmarking surfaced real correctness bugs, all fixed:
 
 - `log -p -N` ignored every count except `-1`, walking all of history.
 - `qel gc` could delete live packs: its "keep newest two files by name"
@@ -80,32 +92,29 @@ Benchmarking surfaced real correctness bugs, all fixed:
 
 ## Remaining gaps
 
-- **`pack-objects` (~41x)** — the honest cost of a from-scratch DEFLATE
-  versus tuned zlib, plus a simpler delta search than git's
-  multi-window type/size clustering. Correct and size-competitive; slow.
-- **`cat-file` / `hash-object` (2–6x)** — same codec-speed story:
-  inflate/deflate throughput is ~1.8–2.6x slower than system zlib.
-- **`blame` (~9x)** — Myers diff plus per-line splitting across every
-  commit; the diff cost cap prevents pathological blowups but the
-  per-commit diff itself is not cached.
-- Git reuses delta chains when repacking a packed repo and keeps pack
-  reverse indexes (`.rev`) / reachability bitmaps for instant object
-  lookup; qel writes plain packs+idx.
+- **`pack-objects`** — qel always deltifies from scratch (window-limited
+  recent-base search): ~1.4 s for 1,533 objects. Git additionally
+  *reuses* delta chains when repacking packed objects (the 11 ms / 45 KB
+  numbers), and its multi-window search over size-bucketed objects finds
+  better bases when starting loose. Implementing delta reuse for repack
+  would close most of the remaining gap on packed inputs.
+- **`cat-file`/`hash-object` (1.6–2.5x)** — single-call codec overhead
+  plus qel's buffer copies; zlib itself is no longer the limiter.
+- **`blame` (~2.8x)** — per-commit Myers diffs, no diff caching.
+- Git keeps pack reverse indexes (`.rev`) and reachability bitmaps for
+  near-instant object lookup; qel writes plain packs+idx.
 
 ## Reproducing
 
 ```sh
 cargo build --release
-# clone of any moderately-sized repo, packed:
-git -C repo gc --aggressive
-# then time pairs, e.g.
+# any moderately-sized packed repo:
 time git -C repo status
 time qel -C repo status   # or: cd repo && qel status
 ```
 
-The exact harness used for these numbers is a `best-of-N` `date +%s%N`
-loop around each command pair; nothing fancy — the point is identical
-inputs on identical storage.
+The harness used for these numbers is a `best-of-N` `date +%s%N` loop
+around each command pair — identical inputs on identical storage.
 
 ## Correctness status at measurement time
 
@@ -116,3 +125,5 @@ inputs on identical storage.
   is clean on the result.
 - `qel clone` → `git fsck` → `git rev-list --all --count` match the
   source repository exactly.
+- Loose objects written by qel (zlib-rs streams) are read by real git;
+  git-written objects inflate identically through zlib-rs.

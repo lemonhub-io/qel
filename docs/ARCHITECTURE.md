@@ -5,10 +5,11 @@ commands → wire protocol.
 
 ```
 main.rs        entry: argv → commands::dispatch
-util.rs        hex, crc32, adler32, big-endian helpers, GitError, atomic writes
-sha1.rs        streaming SHA-1 (used for objects, packs, trailers)
-zlib.rs        inflate (stored/fixed/dynamic) + deflate (LZ77, hash chains,
-               fixed Huffman); streaming inflate with consumed-byte reporting
+util.rs        hex, crc32 (crc32fast), big-endian helpers, GitError,
+               atomic writes
+sha1.rs        SHA-1 (RustCrypto `sha1` crate; objects, packs, trailers)
+zlib.rs        zlib streams via `flate2`/`zlib-rs`; `inflate` reports
+               consumed input bytes for stream parsing
 ```
 
 ## Object layer

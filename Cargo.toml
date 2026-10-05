@@ -2,10 +2,13 @@
 name = "qel"
 version = "0.1.0"
 edition = "2024"
-description = "A complete Git implementation from scratch in pure Rust — zero dependencies"
+description = "A complete Git implementation in Rust — all Git semantics in-tree, primitives (zlib, SHA-1, CRC32) from crates"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/lemonhub-io/qel"
-keywords = ["git", "vcs", "protocol", "no-dependencies"]
+keywords = ["git", "vcs", "protocol"]
 categories = ["command-line-utilities"]
 
 [dependencies]
+crc32fast = "1.5.2"
+flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs"] }
+sha1 = "0.11.0"

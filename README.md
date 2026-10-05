@@ -1,9 +1,12 @@
 # qel
 
-A complete Git implementation from scratch in Rust. **Zero dependencies** —
-everything is built on `std`: SHA-1, zlib (inflate *and* deflate), the object
-model, the index, refs, packfiles and delta chains, the pkt-line wire protocol,
-transports, and both ends of protocols v0 **and v2**.
+A complete Git implementation in Rust. **Every Git behavior is implemented
+in-tree** — the object model, the index, refs, packfiles and delta chains,
+the pkt-line wire protocol, transports, and both ends of protocols v0
+**and v2**. The only external crates are byte-level primitives:
+zlib compression ([`zlib-rs`](https://github.com/trifectatechfoundation/zlib-rs)
+via `flate2`), SHA-1 (RustCrypto `sha1`), and CRC32 (`crc32fast`) — formats,
+negotiation, and semantics are all ours.
 
 qel interoperates with real Git in both directions:
 
@@ -23,8 +26,9 @@ cargo build --release
 # binary: target/release/qel
 ```
 
-Requires a recent stable Rust toolchain (edition 2024). No crates are
-downloaded — `Cargo.toml` has an empty `[dependencies]` section.
+Requires a recent stable Rust toolchain (edition 2024). Three crate
+dependencies — `flate2` (zlib-rs backend), `sha1`, `crc32fast` — all pure
+Rust, fetched by cargo as usual.
 
 ## Usage
 
@@ -91,8 +95,8 @@ honors the usual environment variables: `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`,
 
 | Area | Coverage |
 |---|---|
-| Hashing | SHA-1 from scratch |
-| Compression | zlib inflate (stored/fixed/dynamic blocks) and deflate (LZ77 + fixed Huffman) from scratch |
+| Hashing | SHA-1 (RustCrypto `sha1` crate — SHA-NI accelerated) |
+| Compression | zlib streams via `flate2`/`zlib-rs`; pack framing and delta chains in-tree |
 | Objects | blob, tree, commit, annotated tag; loose + packed storage; alternates |
 | Packs | pack + idx read/write, OFS_DELTA, REF_DELTA, thin-pack resolution, deep delta chains |
 | Index | read v2/v3/v4, write v2/v3, racy-clean handling, intent-to-add, skip-worktree bits |
@@ -167,9 +171,10 @@ Validated against Git 2.43.0:
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). The short version: no dependencies,
-no shelling out to git, match git's bytes — verify with `git fsck`,
-`git verify-pack`, and `GIT_TRACE_PACKET=1`.
+See [CONTRIBUTING.md](CONTRIBUTING.md). The short version: primitives may
+come from crates, Git semantics may not; no shelling out to git, match
+git's bytes — verify with `git fsck`, `git verify-pack`, and
+`GIT_TRACE_PACKET=1`.
 
 ## License
 

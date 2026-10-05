@@ -12,8 +12,9 @@ cd qel
 cargo build
 ```
 
-That's it. There are **no dependencies** — `cargo build` never touches the
-network. A recent stable Rust toolchain (edition 2024) is required.
+That's it. Dependencies are limited to three pure-Rust crates
+(`flate2`/`zlib-rs`, `sha1`, `crc32fast`), fetched by cargo. A recent
+stable Rust toolchain (edition 2024) is required.
 
 The debug binary is `target/debug/qel`. Set an alias or export it for
 testing:
@@ -26,9 +27,14 @@ export GIT_COMMITTER_NAME=Test GIT_COMMITTER_EMAIL=t@e.st
 
 ## Project rules
 
-1. **No external crates, ever.** `Cargo.toml`'s `[dependencies]` section
-   stays empty. Everything — SHA-1, zlib, delta resolution, pkt-line — is
-   implemented in `src/` on `std`.
+1. **Dependencies are limited to byte-level primitives.** Compression
+   (zlib), hashing (SHA-1), and checksums (CRC32) may come from
+   maintained crates — they are formats' building blocks, not Git logic.
+   Everything that makes Git *Git* — the object model, pack/idx formats,
+   delta resolution, refs, the index, pkt-line, protocol negotiation,
+   diff — stays implemented in `src/`. Never add a crate that provides
+   Git functionality (object stores, transports, porcelain helpers,
+   libgit2 bindings).
 2. **No shelling out to git for core behavior.** The only spawned programs
    are `ssh` (ssh transport), `curl` (HTTPS transport), and the editor for
    `commit` without `-m`. If you find yourself wanting `Command::new("git")`,

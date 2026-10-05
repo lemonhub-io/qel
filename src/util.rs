@@ -96,53 +96,10 @@ pub fn be_u64(b: &[u8]) -> u64 {
 
 // ---------- CRC-32 (IEEE, same polynomial as zlib/gzip) ----------
 
-pub struct Crc32 {
-    table: [u32; 256],
-    value: u32,
-}
-
-impl Crc32 {
-    pub fn new() -> Self {
-        let mut table = [0u32; 256];
-        for i in 0..256u32 {
-            let mut c = i;
-            for _ in 0..8 {
-                c = if c & 1 != 0 { 0xEDB88320 ^ (c >> 1) } else { c >> 1 };
-            }
-            table[i as usize] = c;
-        }
-        Crc32 { table, value: 0xFFFFFFFF }
-    }
-
-    pub fn update(&mut self, data: &[u8]) {
-        for &b in data {
-            let idx = ((self.value ^ b as u32) & 0xFF) as usize;
-            self.value = self.table[idx] ^ (self.value >> 8);
-        }
-    }
-
-    pub fn finish(&self) -> u32 {
-        self.value ^ 0xFFFFFFFF
-    }
-}
-
+/// CRC-32 over `data` — thin wrapper over `crc32fast` (SSE4.2
+/// hardware CRC where available). Used for pack idx checksums.
 pub fn crc32(data: &[u8]) -> u32 {
-    let mut c = Crc32::new();
-    c.update(data);
-    c.finish()
-}
-
-// ---------- Adler-32 ----------
-
-pub fn adler32(data: &[u8]) -> u32 {
-    const MOD: u32 = 65521;
-    let mut a: u32 = 1;
-    let mut b: u32 = 0;
-    for &byte in data {
-        a = (a + byte as u32) % MOD;
-        b = (b + a) % MOD;
-    }
-    (b << 16) | a
+    crc32fast::hash(data)
 }
 
 // ---------- file helpers ----------

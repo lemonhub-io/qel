@@ -5,6 +5,33 @@ All notable changes to qel are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **External crates for byte-level primitives**: zlib moved to
+  `flate2` on the pure-Rust `zlib-rs` backend, SHA-1 to the RustCrypto
+  `sha1` crate, and idx CRC32 to `crc32fast`. All Git semantics —
+  object model, pack/idx formats, delta resolution, refs, index,
+  pkt-line, protocol negotiation — remain implemented in-tree. Measured
+  effect: `pack-objects` 5.5s → 1.4s, `fsck` now faster than git,
+  `blame` 178ms → 50ms, 20MB `hash-object` 894ms → 177ms (git: 107ms).
+- `write_pack_delta` produces OFS_DELTA chains (~1 MB pack vs 6.6 MB
+  full-object on the benchmark repo), and `index-pack`/`store_pack`
+  store complete received packs verbatim with an offsets-based idx
+  (index-pack: ~31s → ~10ms).
+
+### Fixed
+
+- `qel gc` no longer deletes live packs: the prune step now tracks
+  `pack-*` basenames, honors `*.keep`, and leaves `tmp_pack_*` alone.
+- `qel daemon` no longer emits pkt-lines over `LARGE_PACKET_MAX` —
+  `git clone` from qel now works on repositories with packs > 64 KB.
+- Delta pack idx files are generated in physical pack order
+  (previously scrambled oid→offset mappings broke clones while
+  `index-pack --strict` still passed).
+- `log -p -N` honors arbitrary counts, not just `-1`.
+- Myers diff has a cost cap (`DIFF_MAX_COST`) with a valid
+  non-minimal fallback, preventing quadratic blowups.
+
 ### Added
 
 - **Protocol v2**, client and server: version negotiation over `git://`
