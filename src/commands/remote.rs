@@ -1037,7 +1037,7 @@ fn open_server_repo(path: &str) -> Result<Repo> {
     Repo::open(&p, None)
 }
 
-/// `rgit upload-pack [--strict] [--stateless-rpc] [--advertise-refs] <dir>`
+/// `qel upload-pack [--strict] [--stateless-rpc] [--advertise-refs] <dir>`
 /// Serves one fetch session on stdin/stdout (how ssh transport invokes it,
 /// or behind a CGI for smart HTTP).
 fn cmd_upload_pack(args: &[String]) -> Result<i32> {
@@ -1075,7 +1075,7 @@ fn cmd_upload_pack(args: &[String]) -> Result<i32> {
     protocol::serve_upload_pack(&repo, &mut r, &mut w).map(|_| 0)
 }
 
-/// `rgit receive-pack [--stateless-rpc] [--advertise-refs] <dir>`
+/// `qel receive-pack [--stateless-rpc] [--advertise-refs] <dir>`
 fn cmd_receive_pack(args: &[String]) -> Result<i32> {
     let mut path = None;
     let mut advertise = false;
@@ -1109,7 +1109,7 @@ fn cmd_receive_pack(args: &[String]) -> Result<i32> {
 
 // ============================== daemon ==============================
 
-/// `rgit daemon [--port=N] [--base-path=P] [--export-all]
+/// `qel daemon [--port=N] [--base-path=P] [--export-all]
 ///              [--enable=<svc>] [--disable=<svc>] [--enable-all] [dir...]`
 /// Speaks the git:// protocol; real git can clone/fetch/push against it.
 fn cmd_daemon(args: &[String]) -> Result<i32> {
@@ -1170,7 +1170,7 @@ fn cmd_daemon(args: &[String]) -> Result<i32> {
     }
     let _ = disabled_all;
     let listener = TcpListener::bind(format!("{}:{}", listen, port))?;
-    eprintln!("rgit daemon: listening on {}:{}", listen, port);
+    eprintln!("qel daemon: listening on {}:{}", listen, port);
     for stream in listener.incoming() {
         match stream {
             Ok(s) => {

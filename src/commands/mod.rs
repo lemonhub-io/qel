@@ -40,7 +40,7 @@ pub fn dispatch(args: &[String]) -> Result<i32> {
                 chdir = args.get(i).cloned();
             }
             "--version" | "-V" | "version" => {
-                println!("rgit version 2.43.0-compatible");
+                println!("qel version 2.43.0-compatible");
                 return Ok(0);
             }
             "--help" | "-h" | "help" => {
@@ -81,7 +81,7 @@ pub fn dispatch(args: &[String]) -> Result<i32> {
         return local::run(cmd, cmd_args);
     }
     Err(GitError::InvalidInput(format!(
-        "'{}' is not an rgit command. See 'rgit --help'.",
+        "'{}' is not an qel command. See 'qel --help'.",
         cmd
     )))
 }
@@ -92,7 +92,7 @@ fn print_usage() {
         .chain(REMOTE_CMDS.iter())
         .copied()
         .collect();
-    println!("usage: rgit [-C <path>] <command> [<args>]\n");
+    println!("usage: qel [-C <path>] <command> [<args>]\n");
     println!("commands: {}", cmds.join(" "));
 }
 

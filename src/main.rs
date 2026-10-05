@@ -1,4 +1,4 @@
-//! rgit - a git implementation in pure Rust std.
+//! qel - a git implementation in pure Rust std.
 mod commands;
 mod config;
 mod diff;
@@ -27,7 +27,7 @@ fn main() {
     let code = match commands::dispatch(&args) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("rgit: {}", e);
+            eprintln!("qel: {}", e);
             128
         }
     };

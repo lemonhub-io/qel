@@ -148,7 +148,7 @@ pub fn adler32(data: &[u8]) -> u32 {
 
 /// Write a file atomically-ish: write to temp then rename.
 pub fn write_file_atomic(path: &std::path::Path, data: &[u8]) -> io::Result<()> {
-    let tmp = path.with_extension("tmp_rgit");
+    let tmp = path.with_extension("tmp_qel");
     {
         let mut f = std::fs::File::create(&tmp)?;
         use io::Write;

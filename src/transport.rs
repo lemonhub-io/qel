@@ -205,20 +205,20 @@ pub fn http_request(
         .arg("-D").arg("-"); // dump headers to stdout; body to temp file
     let tmp_in;
     if let Some(b) = body {
-        tmp_in = std::env::temp_dir().join(format!("rgit-req-{}", std::process::id()));
+        tmp_in = std::env::temp_dir().join(format!("qel-req-{}", std::process::id()));
         std::fs::write(&tmp_in, b)?;
         cmd.arg("--data-binary").arg(format!("@{}", tmp_in.display()));
     }
     for (k, v) in headers {
         cmd.arg("-H").arg(format!("{}: {}", k, v));
     }
-    let tmp_out = std::env::temp_dir().join(format!("rgit-resp-{}", std::process::id()));
+    let tmp_out = std::env::temp_dir().join(format!("qel-resp-{}", std::process::id()));
     cmd.arg("-o").arg(&tmp_out).arg(url);
     let out = cmd.output()?;
     let body_bytes = std::fs::read(&tmp_out).unwrap_or_default();
     let _ = std::fs::remove_file(&tmp_out);
     if body.is_some() {
-        let _ = std::fs::remove_file(std::env::temp_dir().join(format!("rgit-req-{}", std::process::id())));
+        let _ = std::fs::remove_file(std::env::temp_dir().join(format!("qel-req-{}", std::process::id())));
     }
     if !out.status.success() {
         return Err(GitError::Protocol(format!(

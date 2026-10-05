@@ -182,7 +182,7 @@ pub fn build_fetch_request(
         "ofs-delta",
         "no-progress",
         "include-tag",
-        "agent=rgit/0.1",
+        "agent=qel/0.1",
         "object-format=sha1",
     ]
     .iter()
@@ -438,7 +438,7 @@ pub fn build_push_request(
     if updates.is_empty() {
         return Ok(Vec::new());
     }
-    let want_caps: Vec<&str> = ["report-status", "side-band-64k", "agent=rgit/0.1", "atomic"]
+    let want_caps: Vec<&str> = ["report-status", "side-band-64k", "agent=qel/0.1", "atomic"]
         .iter()
         .filter(|c| c.starts_with("agent=") || caps.contains(**c))
         .copied()
@@ -650,7 +650,7 @@ const SERVER_CAPS_UPLOAD: &[&str] = &[
     "no-progress",
     "include-tag",
     "object-format=sha1",
-    "agent=rgit/0.1",
+    "agent=qel/0.1",
 ];
 
 /// Capabilities we advertise as receive-pack.
@@ -662,7 +662,7 @@ const SERVER_CAPS_RECEIVE: &[&str] = &[
     "no-progress",
     "ofs-delta",
     "object-format=sha1",
-    "agent=rgit/0.1",
+    "agent=qel/0.1",
 ];
 
 /// Write the v0 ref advertisement: HEAD first (with symref= + capabilities
