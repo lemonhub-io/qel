@@ -158,6 +158,8 @@ Validated against Git 2.43.0:
   the negotiation edge cases that bite
 - [docs/STORAGE.md](docs/STORAGE.md) — on-disk formats (objects, packs,
   index, refs) as implemented
+- [docs/BENCHMARKS.md](docs/BENCHMARKS.md) — performance comparison vs
+  git 2.43, optimizations applied, and remaining gaps
 - [CONTRIBUTING.md](CONTRIBUTING.md) — development rules and how to verify
   changes against real git
 - [SECURITY.md](SECURITY.md) — vulnerability reporting and hardening notes
