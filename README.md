@@ -26,9 +26,10 @@ cargo build --release
 # binary: target/release/qel
 ```
 
-Requires a recent stable Rust toolchain (edition 2024). Three crate
-dependencies — `flate2` (zlib-rs backend), `sha1`, `crc32fast` — all pure
-Rust, fetched by cargo as usual.
+Requires a recent stable Rust toolchain (edition 2024). Dependencies are
+byte-level primitives only — `flate2` (zlib-rs backend), `sha1`,
+`crc32fast`, plus `libc` on Unix for SIGPIPE handling — all pure Rust,
+fetched by cargo as usual.
 
 ## Usage
 

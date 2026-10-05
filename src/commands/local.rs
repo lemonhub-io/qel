@@ -332,6 +332,22 @@ fn cmd_add(args: &[String]) -> Result<i32> {
             }
         }
     }
+    // git parity: every pathspec must match something
+    if spec_args.iter().any(|s| s != ".") {
+        for (i, spec) in specs.iter().enumerate() {
+            let spec = spec.trim_end_matches('/');
+            let hit = work_files.iter().any(|p| path_match(p, &[spec.to_string()]))
+                || index.entries.iter().any(|e| {
+                    e.path == spec || e.path.starts_with(&format!("{}/", spec))
+                });
+            if !hit {
+                return Err(GitError::InvalidInput(format!(
+                    "fatal: pathspec '{}' did not match any files",
+                    spec_args[i]
+                )));
+            }
+        }
+    }
     if !dry {
         index.save(&repo.index_path())?;
     }
@@ -2770,22 +2786,22 @@ fn cmd_blame(args: &[String]) -> Result<i32> {
     // line positions track "which line of the newer file corresponds"
     let mut lines: Vec<Vec<u8>> = cur_lines.iter().map(|l| l.to_vec()).collect();
     let mut pos_map: Vec<usize> = (0..cur_lines.len()).collect();
+    // cheap path->oid lookups first; only read blobs and diff on real changes
+    let path_oids: Vec<Option<Oid>> = chain
+        .iter()
+        .map(|oid| commit_path(&repo, oid, &rel).map(|e| e.map(|(_, o)| o)))
+        .collect::<Result<_>>()?;
     for (i, oid) in chain.iter().enumerate() {
-        let map = commit_map(&repo, oid)?;
-        let this_data = match map.get(&rel) {
-            Some((_, o)) => blob_or_empty(&repo, o),
+        let this_oid = match path_oids[i] {
+            Some(o) => o,
             None => continue, // file added later / not present
         };
-        let parent_data = if i + 1 < chain.len() {
-            commit_map(&repo, &chain[i + 1])?
-                .get(&rel)
-                .map(|(_, o)| blob_or_empty(&repo, o))
-        } else {
-            None
-        };
-        if parent_data.as_ref() == Some(&this_data) {
-            continue;
+        let parent_oid = path_oids.get(i + 1).copied().flatten();
+        if parent_oid == Some(this_oid) {
+            continue; // file unchanged between parent and commit
         }
+        let this_data = blob_or_empty(&repo, &this_oid);
+        let parent_data = parent_oid.map(|o| blob_or_empty(&repo, &o));
         let this_lines = diff::split_lines(&this_data);
         let parent_lines: Vec<&[u8]> = match &parent_data {
             Some(p) => diff::split_lines(p),
@@ -2838,9 +2854,14 @@ fn cmd_blame(args: &[String]) -> Result<i32> {
             *b = Some(head);
         }
     }
+    let root = *chain.last().unwrap();
     for (i, l) in cur_lines.iter().enumerate() {
-        let o = blame[i].map(|o| o.short(7)).unwrap_or_else(|| "0000000".into());
-        print!("{} ({}) {}", o, i + 1, String::from_utf8_lossy(l));
+        let (mark, o) = match blame[i] {
+            Some(o) if o == root => ("^", o.short(7)),
+            Some(o) => ("", o.short(7)),
+            None => ("", "0000000".into()),
+        };
+        print!("{}{} ({}) {}", mark, o, i + 1, String::from_utf8_lossy(l));
     }
     Ok(0)
 }
@@ -2862,6 +2883,16 @@ fn cmd_index_pack(args: &[String]) -> Result<i32> {
     };
     let resolve = |oid: &Oid| repo.odb.read_opt(oid).ok().flatten();
     let objects = crate::pack::resolve_pack(&data, &resolve)?;
+    if file != "--stdin" {
+        // git parity: `index-pack <file>` writes <file>.idx alongside,
+        // importing nothing into the object store
+        let oids: Vec<Oid> = objects.objects.iter().map(|o| o.0).collect();
+        let idx = crate::pack::write_idx_offsets(&data, &oids, &objects.offsets)?;
+        std::fs::write(std::path::Path::new(&file).with_extension("idx"), &idx)?;
+        // git prints the pack checksum — the trailing 20 bytes of the pack
+        println!("{}", Oid::from_bytes(&data[data.len() - 20..])?.hex());
+        return Ok(0);
+    }
     let dir = repo.odb.primary_dir().join("pack");
     let name = if objects.thin {
         // thin packs must be completed: rewrite as full objects

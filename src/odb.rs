@@ -214,7 +214,7 @@ impl Odb {
         }
         let mut payload = format!("{} {}\0", ty.name(), data.len()).into_bytes();
         payload.extend_from_slice(data);
-        let compressed = zlib::deflate(&payload);
+        let compressed = zlib::deflate_loose(&payload);
         crate::util::write_file_atomic(&path, &compressed)?;
         // loose objects are read-only
         #[cfg(unix)]

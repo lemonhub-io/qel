@@ -103,6 +103,9 @@ impl Index {
                 if version < 3 {
                     return Err(GitError::Parse("index: extended flags in v2".into()));
                 }
+                if p + 2 > raw.len() {
+                    return Err(GitError::Parse("index: truncated extended flags".into()));
+                }
                 let x = be_u16(&raw[p..p + 2]);
                 skip_worktree = x & 0x4000 != 0;
                 intent_to_add = x & 0x2000 != 0;
@@ -113,7 +116,9 @@ impl Index {
                 // prefix compression: varint strip + NUL-terminated suffix
                 let mut strip: usize = 0;
                 loop {
-                    let b = raw[p];
+                    let b = *raw
+                        .get(p)
+                        .ok_or_else(|| GitError::Parse("index v4: truncated varint".into()))?;
                     p += 1;
                     strip = (strip << 7) | (b & 0x7f) as usize;
                     if b & 0x80 == 0 {
@@ -125,7 +130,13 @@ impl Index {
                     .iter()
                     .position(|&b| b == 0)
                     .ok_or_else(|| GitError::Parse("index v4: no NUL".into()))?;
-                let keep = prev_path.len() - strip;
+                let keep = prev_path
+                    .len()
+                    .checked_sub(strip)
+                    .ok_or_else(|| GitError::Parse("index v4: strip exceeds prefix".into()))?;
+                if !prev_path.is_char_boundary(keep) {
+                    return Err(GitError::Parse("index v4: strip mid-character".into()));
+                }
                 let mut s = String::with_capacity(keep + nul);
                 s.push_str(&prev_path[..keep]);
                 s.push_str(std::str::from_utf8(&raw[p..p + nul]).map_err(|_| {
@@ -143,6 +154,9 @@ impl Index {
                 } else {
                     namelen
                 };
+                if name_start + name_len > raw.len() {
+                    return Err(GitError::Parse("index: truncated name".into()));
+                }
                 path = String::from_utf8_lossy(&raw[name_start..name_start + name_len])
                     .to_string();
                 // entry padded to multiple of 8, with 1-8 NULs

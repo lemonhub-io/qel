@@ -348,6 +348,33 @@ pub fn commit_map(repo: &Repo, oid: &Oid) -> Result<BTreeMap<String, (u32, Oid)>
     Ok(m)
 }
 
+/// Look up a single path in a commit's tree: (mode, oid).
+/// Walks only the path components — much cheaper than `commit_map`
+/// when only one file is needed (e.g. per-commit checks in blame).
+pub fn commit_path(repo: &Repo, oid: &Oid, path: &str) -> Result<Option<(u32, Oid)>> {
+    let mut cur = crate::tree::peel_to_tree(repo, &crate::tree::peel_to_commit(repo, oid)?)?;
+    let clean = path.trim_matches('/');
+    if clean.is_empty() {
+        return Ok(Some((0o040000, cur)));
+    }
+    let mut parts = clean.split('/').peekable();
+    while let Some(part) = parts.next() {
+        let entries = crate::tree::read_tree_entries(repo, &cur)?;
+        let e = match entries.iter().find(|e| e.name == part) {
+            Some(e) => e,
+            None => return Ok(None),
+        };
+        if parts.peek().is_none() {
+            return Ok(Some((e.mode, e.oid)));
+        }
+        if e.mode & 0o170000 != 0o040000 {
+            return Ok(None); // path component is not a directory
+        }
+        cur = e.oid;
+    }
+    Ok(None)
+}
+
 // ============================== three-way tree merge ==============================
 
 pub struct TreeMerge {

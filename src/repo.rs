@@ -369,13 +369,20 @@ impl Repo {
 
     fn ident(&self, name_env: &str, email_env: &str, date_env: &str) -> Result<Ident> {
         let cfg = self.config();
+        let role = if name_env.contains("AUTHOR") {
+            "Author"
+        } else {
+            "Committer"
+        };
         let name = std::env::var(name_env)
             .ok()
             .or_else(|| cfg.get("user.name"))
             .ok_or_else(|| {
-                GitError::InvalidInput(
-                    "*** Please tell me who you are.\n\nRun\n\n  git config --global user.name \"Your Name\"\n  git config --global user.email you@example.com\n\nOmit --global to set the identity only in this repository.\n\nunable to auto-detect name".into(),
-                )
+                GitError::InvalidInput(format!(
+                    "{} identity unknown\n\n*** Please tell me who you are.\n\nRun\n\n  git config --global user.name \"Your Name\"\n  git config --global user.email you@example.com\n\nto set your account's default identity.\nOmit --global to set the identity only in this repository.\n\nfatal: unable to auto-detect name (got '{}')",
+                    role,
+                    whoami()
+                ))
             })?;
         let email = std::env::var(email_env)
             .ok()

@@ -22,30 +22,31 @@ measured on identical repositories and workloads.
 
 | Operation                | git 2.43 | qel     | Ratio        |
 |--------------------------|----------|---------|--------------|
-| `status`                 |    24 ms |   18 ms | qel faster   |
-| `add -A`                 |     7 ms |    8 ms | ~tie         |
-| `diff`                   |     6 ms |    6 ms | tie          |
-| `log --oneline`          |    11 ms |   22 ms | 2.0x         |
-| `rev-list --all`         |     8 ms |   20 ms | 2.5x         |
-| `log -p -20`             |   105 ms |   92 ms | qel faster   |
-| `blame`                  |    18 ms |   50 ms | 2.8x         |
-| `checkout`               |    24 ms |   37 ms | 1.5x         |
-| `hash-object -w` (20 MB) |   107 ms |  177 ms | 1.65x        |
-| `cat-file -p` (20 MB)    |    48 ms |  119 ms | 2.5x         |
-| `fsck`                   |  1369 ms |  717 ms | qel faster   |
-| `pack-objects`           |    11* ms| 1391 ms | see note     |
-| `index-pack`             |     9 ms |   10 ms | tie          |
-| `clone` (local path)     |     5 ms |    7 ms | ~tie         |
+| `status`                 |    10 ms |   14 ms | ~tie         |
+| `add -A`                 |     8 ms |    9 ms | ~tie         |
+| `diff`                   |     6 ms |    7 ms | tie          |
+| `log --oneline`          |    12 ms |   26 ms | 2.2x         |
+| `rev-list --all`         |     9 ms |   22 ms | 2.4x         |
+| `log -p -20`             |   132 ms |   84 ms | qel faster   |
+| `blame`                  |    23 ms |   33 ms | 1.4x         |
+| `checkout`               |    27 ms |   40 ms | 1.5x         |
+| `hash-object -w` (20 MB) |   100 ms |  184 ms | 1.8x         |
+| `cat-file -p` (20 MB)    |    46 ms |  115 ms | 2.5x         |
+| `fsck`                   |  1484 ms |  822 ms | qel faster   |
+| `pack-objects`           |    15* ms| 1033 ms | see note     |
+| `index-pack`             |    12 ms |   14 ms | tie          |
+| `clone` (local path)     |     8 ms |    7 ms | ~tie         |
 | `clone` via `git://`     |   8–9 ms | 6–22 ms | tie, both directions |
 | `clone --depth=50`       |    86 ms |    6 ms | qel faster   |
 
-\* `git pack-objects` at 11 ms is reading already-packed objects and
-**reusing their delta chains** wholesale — it emits a 45 KB pack without
-deltifying at all. When forced to deltify (no reusable source deltas)
-git measured ~133 ms on this object set, versus qel's ~1.4 s. qel's
-from-scratch pack is 932 KB. Two separate gaps remain: qel does not yet
-reuse source deltas when repacking, and its window-limited delta search
-is ~10x slower than git's size-bucketed multi-window search.
+\* `git pack-objects` at 15 ms is reading already-packed objects and
+**reusing their delta chains** wholesale. When forced to deltify (no
+reusable source deltas) git measured ~133 ms on this object set, versus
+qel's ~1.0 s — qel now deltifies in parallel (per-thread windows, the
+same scheme as `git --threads`) but its single-object delta search is
+still ~8x slower. Two separate gaps remain: qel does not reuse source
+deltas when repacking, and its per-base delta index is simpler than
+git's size-bucketed multi-window search.
 
 ## What switching the codec bought
 
@@ -55,12 +56,12 @@ previous in-house codec:
 
 | Operation | own codec | zlib-rs | git |
 |---|---|---|---|
-| `pack-objects` | 5503 ms | 1391 ms | 11–133 ms |
-| `hash-object` 20 MB | 894 ms | 177 ms | 107 ms |
-| `cat-file` 20 MB | 502 ms | 119 ms | 48 ms |
-| `blame` | 178 ms | 50 ms | 18 ms |
-| `fsck` | 4593 ms | 717 ms | 1369 ms |
-| `log -p -20` | 316 ms | 92 ms | 105 ms |
+| `pack-objects` | 5503 ms | 1033 ms (parallel deltify) | 15–133 ms |
+| `hash-object` 20 MB | 894 ms | 184 ms | 100 ms |
+| `cat-file` 20 MB | 502 ms | 119 ms | 46 ms |
+| `blame` | 178 ms | 33 ms | 23 ms |
+| `fsck` | 4593 ms | 822 ms | 1484 ms |
+| `log -p -20` | 316 ms | 84 ms | 132 ms |
 
 ## Earlier optimizations (in-house codec era)
 
@@ -92,15 +93,18 @@ each was fixed and re-verified for correctness:
 
 ## Remaining gaps
 
-- **`pack-objects`** — qel always deltifies from scratch (window-limited
-  recent-base search): ~1.4 s for 1,533 objects. Git additionally
-  *reuses* delta chains when repacking packed objects (the 11 ms / 45 KB
-  numbers), and its multi-window search over size-bucketed objects finds
-  better bases when starting loose. Implementing delta reuse for repack
-  would close most of the remaining gap on packed inputs.
-- **`cat-file`/`hash-object` (1.6–2.5x)** — single-call codec overhead
+- **`pack-objects`** — qel deltifies from scratch in parallel (per-thread
+  windows, same scheme as `git --threads`): ~1.0 s for 1,533 objects.
+  Git additionally *reuses* delta chains when repacking packed objects
+  (the 15 ms / 45 KB numbers). Implementing delta reuse for repack would
+  close most of the remaining gap on packed inputs.
+- **`cat-file`/`hash-object` (1.8–2.5x)** — single-call codec overhead
   plus qel's buffer copies; zlib itself is no longer the limiter.
-- **`blame` (~2.8x)** — per-commit Myers diffs, no diff caching.
+- **`blame` (~1.4x)** — per-commit diffs only when the blob oid actually
+  changed; remaining cost is commit walking.
+- **`log`/`rev-list` (~2x)** — startup overhead: config + refs + pack
+  opening costs ~10 ms before the first commit parses; git's tighter
+  startup wins on small histories.
 - Git keeps pack reverse indexes (`.rev`) and reachability bitmaps for
   near-instant object lookup; qel writes plain packs+idx.
 

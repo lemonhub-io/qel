@@ -30,7 +30,9 @@ pub fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
         )));
     }
     let tgt_size = read_varint(delta, &mut pos)? as usize;
-    let mut out = Vec::with_capacity(tgt_size);
+    // A corrupt delta can claim an absurd target size; cap the eager
+    // allocation and let the vector grow as copies actually land.
+    let mut out = Vec::with_capacity(tgt_size.min(1 << 28));
     while pos < delta.len() {
         let cmd = delta[pos];
         pos += 1;
@@ -40,13 +42,19 @@ pub fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
             let mut size = 0usize;
             for i in 0..4 {
                 if cmd & (1 << i) != 0 {
-                    offset |= (delta[pos] as usize) << (i * 8);
+                    offset |= (*delta.get(pos).ok_or_else(|| {
+                        GitError::ObjectCorrupt("delta copy field truncated".into())
+                    })? as usize)
+                        << (i * 8);
                     pos += 1;
                 }
             }
             for i in 0..3 {
                 if cmd & (0x10 << i) != 0 {
-                    size |= (delta[pos] as usize) << (i * 8);
+                    size |= (*delta.get(pos).ok_or_else(|| {
+                        GitError::ObjectCorrupt("delta size field truncated".into())
+                    })? as usize)
+                        << (i * 8);
                     pos += 1;
                 }
             }
@@ -86,6 +94,9 @@ fn read_varint(data: &[u8], pos: &mut usize) -> Result<u64> {
         if *pos >= data.len() {
             return Err(GitError::Parse("varint overrun".into()));
         }
+        if shift >= 64 {
+            return Err(GitError::Parse("varint too long".into()));
+        }
         let b = data[*pos];
         *pos += 1;
         v |= ((b & 0x7f) as u64) << shift;
@@ -118,13 +129,18 @@ pub fn parse_entry_header(pack: &[u8], offset: usize) -> Result<EntryHeader> {
     if i >= pack.len() {
         return Err(GitError::Parse("pack: entry offset out of range".into()));
     }
-    let mut c = pack[i];
+    let byte_at = |i: usize| -> Result<u8> {
+        pack.get(i)
+            .copied()
+            .ok_or_else(|| GitError::Parse("pack: truncated entry header".into()))
+    };
+    let mut c = byte_at(i)?;
     i += 1;
     let type_id = (c >> 4) & 0x7;
     let mut size: u64 = (c & 0x0f) as u64;
     let mut shift = 4;
     while c & 0x80 != 0 {
-        c = pack[i];
+        c = byte_at(i)?;
         i += 1;
         size |= ((c & 0x7f) as u64) << shift;
         shift += 7;
@@ -134,11 +150,11 @@ pub fn parse_entry_header(pack: &[u8], offset: usize) -> Result<EntryHeader> {
     match type_id {
         OBJ_OFS_DELTA => {
             // offset encoding: n bytes; value = ((value+1)<<7) | (b&0x7f)
-            let mut b = pack[i];
+            let mut b = byte_at(i)?;
             i += 1;
             let mut off: u64 = (b & 0x7f) as u64;
             while b & 0x80 != 0 {
-                b = pack[i];
+                b = byte_at(i)?;
                 i += 1;
                 off = ((off + 1) << 7) | (b & 0x7f) as u64;
             }
@@ -147,6 +163,9 @@ pub fn parse_entry_header(pack: &[u8], offset: usize) -> Result<EntryHeader> {
             })?);
         }
         OBJ_REF_DELTA => {
+            if i + 20 > pack.len() {
+                return Err(GitError::Parse("pack: truncated ref-delta base".into()));
+            }
             base_oid = Some(Oid::from_bytes(&pack[i..i + 20])?);
             i += 20;
         }
@@ -189,6 +208,9 @@ fn load_idx(path: &Path) -> Result<IdxData> {
         if version != 2 {
             return Err(GitError::Parse(format!("idx version {} unsupported", version)));
         }
+        if raw.len() < 8 + 256 * 4 {
+            return Err(GitError::Parse("idx: truncated fanout".into()));
+        }
         let mut fanout = [0u32; 256];
         for i in 0..256 {
             fanout[i] = be_u32(&raw[8 + i * 4..]);
@@ -198,6 +220,10 @@ fn load_idx(path: &Path) -> Result<IdxData> {
         let crc_base = sha_base + n * 20;
         let off_base = crc_base + n * 4;
         let big_base = off_base + n * 4;
+        if raw.len() < big_base {
+            return Err(GitError::Parse("idx: truncated tables".into()));
+        }
+        let big_avail = (raw.len() - big_base) / 8;
         let mut oids = Vec::with_capacity(n);
         let mut offsets = Vec::with_capacity(n);
         for i in 0..n {
@@ -205,6 +231,9 @@ fn load_idx(path: &Path) -> Result<IdxData> {
             let o32 = be_u32(&raw[off_base + i * 4..]);
             let off = if o32 & 0x8000_0000 != 0 {
                 let bi = (o32 & 0x7fff_ffff) as usize;
+                if bi >= big_avail {
+                    return Err(GitError::Parse("idx: large-offset slot out of range".into()));
+                }
                 be_u64(&raw[big_base + bi * 8..])
             } else {
                 o32 as u64
@@ -223,6 +252,9 @@ fn load_idx(path: &Path) -> Result<IdxData> {
         }
         let n = fanout[255] as usize;
         let base = 1024;
+        if raw.len() < base + n * 24 {
+            return Err(GitError::Parse("idx: truncated v1 entries".into()));
+        }
         let mut oids = Vec::with_capacity(n);
         let mut offsets = Vec::with_capacity(n);
         for i in 0..n {
@@ -673,7 +705,6 @@ fn encode_ofs_delta(mut off: u64) -> Vec<u8> {
 /// delta under half the object's size wins.
 /// Returns (pack_bytes, oids_in_pack_order).
 pub fn write_pack_delta(objects: &[PackObj]) -> (Vec<u8>, Vec<Oid>) {
-    const WINDOW: usize = 10;
     // order: commits first (checkout speed), then trees, blobs, tags;
     // within a type, larger objects first so they serve as delta bases
     fn rank(t: ObjType) -> u8 {
@@ -691,49 +722,131 @@ pub fn write_pack_delta(objects: &[PackObj]) -> (Vec<u8>, Vec<Oid>) {
             std::cmp::Reverse(objects[i].data.len()),
         )
     });
+    // Phase 1 (parallel): partition `order` into per-thread contiguous
+    // chunks — each thread keeps its own `recent` window (same scheme as
+    // `git pack-objects --threads`). Each produces deflated entry bodies;
+    // headers are encoded serially afterwards because OFS_DELTA distances
+    // depend on absolute pack offsets.
+    struct EntryPlan {
+        /// index into `order` of the delta base (same chunk), if delta'd
+        base_pos: Option<usize>,
+        /// uncompressed size that goes in the entry header
+        raw_size: u64,
+        /// is_delta
+        delta: bool,
+        /// deflated body
+        body: Vec<u8>,
+    }
+    fn deltify_chunk(objects: &[PackObj], chunk: &[(usize, usize)]) -> Vec<EntryPlan> {
+        const WINDOW: usize = 10;
+        type Recent = (usize, usize, std::rc::Rc<std::cell::OnceCell<DeltaIndex>>);
+        let mut recent: [Vec<Recent>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+        let mut plans = Vec::with_capacity(chunk.len());
+        for &(pos, oi) in chunk {
+            let o = &objects[oi];
+            let r = rank(o.ty) as usize;
+            let mut best: Option<(usize, Vec<u8>)> = None; // (base order pos, delta)
+            for (bi, bpos, cell) in recent[r].iter().rev().take(WINDOW) {
+                let b = &objects[*bi];
+                // skip mismatched sizes — they never delta well; small objects
+                // need near-identical bases so gate tighter
+                let (lo, hi) = if o.data.len() < 8192 { (4, 4) } else { (8, 8) };
+                if b.data.len() > o.data.len() * hi + 64 || o.data.len() > b.data.len() * lo + 64 {
+                    continue;
+                }
+                let idx = cell.get_or_init(|| DeltaIndex::build(&b.data));
+                let d = create_delta_idx(&b.data, &o.data, idx);
+                if d.len() * 2 < o.data.len()
+                    && best.as_ref().map(|x| d.len() < x.1.len()).unwrap_or(true)
+                {
+                    best = Some((*bpos, d));
+                }
+            }
+            let plan = match best {
+                Some((bpos, d)) => EntryPlan {
+                    base_pos: Some(bpos),
+                    raw_size: d.len() as u64,
+                    delta: true,
+                    body: zlib::deflate(&d),
+                },
+                None => EntryPlan {
+                    base_pos: None,
+                    raw_size: o.data.len() as u64,
+                    delta: false,
+                    body: zlib::deflate(&o.data),
+                },
+            };
+            recent[r].push((oi, pos, std::rc::Rc::new(std::cell::OnceCell::new())));
+            if recent[r].len() > WINDOW {
+                recent[r].remove(0);
+            }
+            plans.push(plan);
+        }
+        plans
+    }
+
+    // (order position, object index) pairs per chunk. Chunks are split
+    // by cumulative uncompressed size — delta cost scales with data
+    // size, so position-even chunks would pile all large blobs on one
+    // thread.
+    let indexed: Vec<(usize, usize)> = order.iter().copied().enumerate().collect();
+    let nthreads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(8)
+        .min(indexed.len().max(1));
+    let total: usize = objects.iter().map(|o| o.data.len().min(1 << 20)).sum();
+    let target = (total / nthreads).max(1);
+    let mut chunk_bounds: Vec<(usize, usize)> = Vec::new();
+    let (mut start, mut acc) = (0usize, 0usize);
+    for (pos, &oi) in order.iter().enumerate() {
+        acc += objects[oi].data.len().min(1 << 20);
+        if acc >= target && pos > start && chunk_bounds.len() + 1 < nthreads {
+            chunk_bounds.push((start, pos));
+            start = pos;
+            acc = 0;
+        }
+    }
+    chunk_bounds.push((start, indexed.len()));
+    let mut plans: Vec<EntryPlan> = Vec::with_capacity(indexed.len());
+    if chunk_bounds.len() <= 1 {
+        plans = deltify_chunk(objects, &indexed[..]);
+    } else {
+        std::thread::scope(|s| {
+            let handles: Vec<_> = chunk_bounds
+                .iter()
+                .map(|&(a, b)| {
+                    let chunk: &[(usize, usize)] = &indexed[a..b];
+                    s.spawn(move || deltify_chunk(objects, chunk))
+                })
+                .collect();
+            for h in handles {
+                plans.extend(h.join().expect("deltify thread panicked"));
+            }
+        });
+    }
+
+    // Phase 2 (serial): assign pack offsets and encode headers.
     let mut out = Vec::new();
     out.extend_from_slice(b"PACK");
     out.extend_from_slice(&2u32.to_be_bytes());
     out.extend_from_slice(&(objects.len() as u32).to_be_bytes());
-    // per-type list of (order_index, pack_offset, lazy base index) —
-    // each base's DeltaIndex is built once and reused across candidates
-    type Recent = (usize, u64, std::rc::Rc<std::cell::OnceCell<DeltaIndex>>);
-    let mut recent: [Vec<Recent>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
-    for &oi in &order {
-        let o = &objects[oi];
-        let r = rank(o.ty) as usize;
-        let mut best: Option<(u64, Vec<u8>)> = None; // (base pack offset, delta)
-        for (bi, boff, cell) in recent[r].iter().rev().take(WINDOW) {
-            let b = &objects[*bi];
-            // skip mismatched sizes — they never delta well; small objects
-            // need near-identical bases so gate tighter
-            let (lo, hi) = if o.data.len() < 8192 { (4, 4) } else { (8, 8) };
-            if b.data.len() > o.data.len() * hi + 64 || o.data.len() > b.data.len() * lo + 64 {
-                continue;
-            }
-            let idx = cell.get_or_init(|| DeltaIndex::build(&b.data));
-            let d = create_delta_idx(&b.data, &o.data, idx);
-            if d.len() * 2 < o.data.len() && best.as_ref().map(|x| d.len() < x.1.len()).unwrap_or(true)
-            {
-                best = Some((*boff, d));
-            }
-        }
+    let mut offsets: Vec<u64> = vec![0; order.len()]; // by order position
+    for (pos, plan) in plans.iter().enumerate() {
         let entry_off = out.len() as u64;
-        match best {
-            Some((boff, d)) => {
-                // OFS_DELTA header: type 6, size = delta byte length
-                write_entry_header(&mut out, OBJ_OFS_DELTA, d.len() as u64);
-                out.extend_from_slice(&encode_ofs_delta(entry_off - boff));
-                out.extend_from_slice(&zlib::deflate(&d));
+        offsets[pos] = entry_off;
+        let oi = order[pos];
+        match plan.base_pos {
+            Some(bpos) => {
+                debug_assert!(plan.delta);
+                write_entry_header(&mut out, OBJ_OFS_DELTA, plan.raw_size);
+                out.extend_from_slice(&encode_ofs_delta(entry_off - offsets[bpos]));
+                out.extend_from_slice(&plan.body);
             }
             None => {
-                write_entry_header(&mut out, obj_type_id(o.ty), o.data.len() as u64);
-                out.extend_from_slice(&zlib::deflate(&o.data));
+                write_entry_header(&mut out, obj_type_id(objects[oi].ty), plan.raw_size);
+                out.extend_from_slice(&plan.body);
             }
-        }
-        recent[r].push((oi, entry_off, std::rc::Rc::new(std::cell::OnceCell::new())));
-        if recent[r].len() > WINDOW {
-            recent[r].remove(0);
         }
     }
     let mut h = Sha1::new();

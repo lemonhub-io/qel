@@ -54,20 +54,27 @@ fn inflate_impl(data: &[u8], size_hint: usize, zlib_header: bool) -> Result<(Vec
 
 /// Deflate `data` as a zlib stream (RFC 1950) at git's default level.
 pub fn deflate(data: &[u8]) -> Vec<u8> {
-    deflate_impl(data, true)
+    deflate_impl(data, 6, true)
+}
+
+/// Deflate at git's `core.looseCompression` default (Z_BEST_SPEED).
+/// Loose objects are written/read constantly; git optimizes for speed
+/// here, not ratio.
+pub fn deflate_loose(data: &[u8]) -> Vec<u8> {
+    deflate_impl(data, 1, true)
 }
 
 /// Deflate `data` as a raw DEFLATE stream.
 #[allow(dead_code)]
 pub fn deflate_raw(data: &[u8]) -> Vec<u8> {
-    deflate_impl(data, false)
+    deflate_impl(data, 6, false)
 }
 
-fn deflate_impl(data: &[u8], zlib_header: bool) -> Vec<u8> {
+fn deflate_impl(data: &[u8], level: u32, zlib_header: bool) -> Vec<u8> {
     // zlib compressBound: source len + ~0.1% + slack.
     let bound = data.len() + data.len() / 1000 + 64;
     let mut out: Vec<u8> = Vec::with_capacity(bound);
-    let mut c = Compress::new(Compression::default(), zlib_header);
+    let mut c = Compress::new(Compression::new(level), zlib_header);
     let mut in_pos = 0usize;
     loop {
         let before = c.total_in() as usize;

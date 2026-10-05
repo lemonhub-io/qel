@@ -7,13 +7,40 @@ All notable changes to qel are documented here. The format follows
 
 ### Changed
 
+- **Parallel `pack-objects`**: deltification is split across threads
+  (per-thread delta windows over size-balanced chunks, same scheme as
+  `git --threads`) — ~1.0 s vs 1.4 s single-threaded on the benchmark
+  repo, pack stays valid under `git index-pack --strict`.
+- Loose objects now deflate at level 1, matching git's
+  `core.looseCompression` default (packs stay at level 6).
+- `blame` walks path→oid lookups instead of full tree maps per commit,
+  skipping blob reads and diffs entirely when the file is unchanged —
+  ~5x faster.
+- `index-pack <file>` now writes `<file>.idx` alongside the pack like
+  git instead of importing into the object store (`--stdin` still
+  imports, matching git's fetch path).
+- `blame` prefixes `^` on boundary (root) commits, matching git.
+- `qel` restores SIGPIPE default handling — `qel log | head` exits
+  silently instead of panicking.
+- `libc` dependency added (Unix only) for SIGPIPE disposition.
+
+### Stability
+
+- Hardened untrusted-input parsers: `apply_delta` bounds all field
+  reads and caps eager allocation, `parse_entry_header` bounds varint
+  and base reads, `load_idx` validates table sizes before indexing,
+  index v4 varint/strip/name reads are bounds-checked.
+- `add <path>` errors `pathspec ... did not match any files` like git
+  instead of silently succeeding.
+- Missing-identity error now matches git's wording and ordering
+  (Author/Committer identity unknown + auto-detect detail).
 - **External crates for byte-level primitives**: zlib moved to
   `flate2` on the pure-Rust `zlib-rs` backend, SHA-1 to the RustCrypto
   `sha1` crate, and idx CRC32 to `crc32fast`. All Git semantics —
   object model, pack/idx formats, delta resolution, refs, index,
   pkt-line, protocol negotiation — remain implemented in-tree. Measured
-  effect: `pack-objects` 5.5s → 1.4s, `fsck` now faster than git,
-  `blame` 178ms → 50ms, 20MB `hash-object` 894ms → 177ms (git: 107ms).
+  effect: `pack-objects` 5.5s → ~1.0s, `fsck` now faster than git,
+  `blame` 178ms → 33ms, 20MB `hash-object` 894ms → 184ms (git: 100ms).
 - `write_pack_delta` produces OFS_DELTA chains (~1 MB pack vs 6.6 MB
   full-object on the benchmark repo), and `index-pack`/`store_pack`
   store complete received packs verbatim with an offsets-based idx
