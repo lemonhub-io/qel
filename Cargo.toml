@@ -2,5 +2,10 @@
 name = "qel"
 version = "0.1.0"
 edition = "2024"
+description = "A complete Git implementation from scratch in pure Rust — zero dependencies"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lemonhub-io/qel"
+keywords = ["git", "vcs", "protocol", "no-dependencies"]
+categories = ["command-line-utilities"]
 
 [dependencies]

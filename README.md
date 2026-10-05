@@ -133,7 +133,33 @@ Validated against Git 2.43.0:
 - Some advanced porcelain is intentionally simplified (interactive rebase,
   submodule operations, bisect, worktrees beyond reading them).
 
-## Layout
+## Documentation
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the module map and
-[docs/PROTOCOL.md](docs/PROTOCOL.md) for notes on the wire protocol.
+- [docs/COMMANDS.md](docs/COMMANDS.md) — full command reference with
+  options and compatibility notes
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — module map and internals
+- [docs/PROTOCOL.md](docs/PROTOCOL.md) — wire protocol v0 notes, including
+  the negotiation edge cases that bite
+- [docs/STORAGE.md](docs/STORAGE.md) — on-disk formats (objects, packs,
+  index, refs) as implemented
+- [CONTRIBUTING.md](CONTRIBUTING.md) — development rules and how to verify
+  changes against real git
+- [SECURITY.md](SECURITY.md) — vulnerability reporting and hardening notes
+- [CHANGELOG.md](CHANGELOG.md) — release history
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). The short version: no dependencies,
+no shelling out to git, match git's bytes — verify with `git fsck`,
+`git verify-pack`, and `GIT_TRACE_PACKET=1`.
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option. Contributions are assumed to be dual-licensed under the
+same terms unless stated otherwise.
+

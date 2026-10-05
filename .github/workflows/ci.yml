@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build qel
+        run: cargo build --release
+
+      - name: Smoke test — qel init/add/commit, then real git validates
+        run: |
+          export QEL=$PWD/target/release/qel
+          export GIT_AUTHOR_NAME=ci GIT_AUTHOR_EMAIL=ci@qel.dev
+          export GIT_COMMITTER_NAME=ci GIT_COMMITTER_EMAIL=ci@qel.dev
+          rm -rf /tmp/qel-smoke && mkdir /tmp/qel-smoke && cd /tmp/qel-smoke
+          $QEL init -q .
+          echo hello > a.txt && mkdir sub && echo world > sub/b.txt
+          $QEL add -A
+          $QEL commit -qm "initial"
+          echo more >> a.txt && $QEL commit -qam "second"
+          git fsck --strict
+          git log --oneline | wc -l | grep -qx 2
+          test "$($QEL log --oneline | wc -l)" = 2
+
+      - name: Interop — git clone of qel repo, qel read of git repo
+        run: |
+          export QEL=$PWD/target/release/qel
+          export GIT_AUTHOR_NAME=ci GIT_AUTHOR_EMAIL=ci@qel.dev
+          export GIT_COMMITTER_NAME=ci GIT_COMMITTER_EMAIL=ci@qel.dev
+          cd /tmp/qel-smoke
+          git clone -q . /tmp/qel-clone
+          diff <(cd /tmp/qel-clone && git ls-files) <(git ls-files)
+          git commit -q --allow-empty -m third
+          test "$($QEL rev-list --count HEAD)" = 3
+
+      - name: Interop — diff byte-parity, pack verify
+        run: |
+          export QEL=$PWD/target/release/qel
+          cd /tmp/qel-smoke
+          echo change >> a.txt
+          $QEL diff > qel.patch && git diff > git.patch
+          diff -u git.patch qel.patch
+          git checkout -q a.txt
+          git rev-parse HEAD | git pack-objects --stdout > /tmp/g.pack
+          mkdir -p /tmp/rd && cd /tmp/rd && $QEL init -q .
+          $QEL index-pack /tmp/g.pack
+          git verify-pack .git/objects/pack/pack-*.idx
