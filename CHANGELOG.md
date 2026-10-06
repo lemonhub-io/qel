@@ -141,6 +141,23 @@ All notable changes to qel are documented here. The format follows
   old+new columns and index blobs.
 - **`mktag`**: validated tag-object creation from stdin.
 - **`push -d`**: remote ref deletion.
+- **Commit pretty-printing engine** shared by `log` and `show`: named
+  presets (`oneline|short|medium|full|fuller|raw|reference`),
+  `format:`/`tformat:` placeholder strings, `--date=` modes
+  (`default|relative|iso|iso-strict|rfc|short|raw|unix|format:<strftime>`)
+  with git's exact relative-date bucketing, `--abbrev-commit`.
+- **`show` output controls**: `--stat|--shortstat|--numstat|--name-only|
+  --name-status|--summary|--patch|--no-patch|-s`, merge semantics
+  (first-parent stat views vs combined-diff patch/name views), `-m`
+  per-parent blocks, `--cc`, `--first-parent`, multiple revs, tag→peeled
+  target display, `tree <rev>` headers, blob passthrough.
+- **`for-each-ref` formats**: `--format` with the common `%(atom)` set
+  (refname modifiers, objectname/type/size, peeled `*` atoms, upstream,
+  author/committer/tagger fields with `:trim`/`:localpart`/date modes,
+  contents/subject/body, HEAD marker), `%XX` byte escapes, fnmatch
+  patterns, `--sort` multi-key, `--count`, `--points-at`, `--merged`,
+  `--no-merged`, `--contains`, `--no-contains`, `--ignore-case`,
+  `--omit-empty`, `--date`.
 
 ### Fixed
 

@@ -193,7 +193,17 @@ pub fn parse_rev(repo: &Repo, spec: &str) -> Result<Oid> {
 
 // ============================== commit printing ==============================
 
+#[allow(dead_code)]
 pub fn format_commit(repo: &Repo, oid: &Oid, decorations: &BTreeMap<Oid, Vec<String>>) -> Result<String> {
+    format_commit_dm(repo, oid, decorations, "")
+}
+
+pub fn format_commit_dm(
+    repo: &Repo,
+    oid: &Oid,
+    decorations: &BTreeMap<Oid, Vec<String>>,
+    date_mode: &str,
+) -> Result<String> {
     let c = crate::revwalk::load_commit(repo, oid)?;
     let mut out = String::new();
     out.push_str(&format!("commit {}", oid.hex()));
@@ -208,13 +218,474 @@ pub fn format_commit(repo: &Repo, oid: &Oid, decorations: &BTreeMap<Oid, Vec<Str
     out.push_str(&format!("Author: {}\n", c.author.who()));
     out.push_str(&format!(
         "Date:   {}\n\n",
-        crate::repo::format_git_date(c.author.time, &c.author.tz)
+        if date_mode.is_empty() {
+            crate::repo::format_git_date(c.author.time, &c.author.tz)
+        } else {
+            format_date_mode(c.author.time, &c.author.tz, date_mode)
+        }
     ));
     for line in c.message.trim_end_matches('\n').lines() {
         out.push_str(&format!("    {}\n", line));
     }
-    out.push('\n');
     Ok(out)
+}
+
+/// git date display for --date=<mode>: default/relative/iso/rfc/short/raw/unix.
+pub fn format_date_mode(ts: i64, tz: &str, mode: &str) -> String {
+    match mode {
+        "relative" => relative_date(ts),
+        "iso" | "iso8601" => iso_date(ts, tz, false),
+        "iso-strict" | "iso8601-strict" => iso_date(ts, tz, true),
+        "rfc" | "rfc2822" => rfc_date(ts, tz),
+        "short" => short_date(ts, tz),
+        "raw" => format!("{} {}", ts, tz),
+        "unix" => format!("{}", ts),
+        "default" | "medium" | "human" | "" => crate::repo::format_git_date(ts, tz),
+        m if m.starts_with("format:") => strftime_like(&m["format:".len()..], ts, tz),
+        _ => crate::repo::format_git_date(ts, tz),
+    }
+}
+
+/// git's show_date_relative (date.c): rounding-then-bucketing algorithm.
+pub fn relative_date(ts: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    if now < ts {
+        return "in the future".to_string();
+    }
+    let mut diff = now - ts;
+    if diff < 90 {
+        return format!("{} second{} ago", diff, if diff == 1 { "" } else { "s" });
+    }
+    diff = (diff + 30) / 60;
+    if diff < 90 {
+        return format!("{} minute{} ago", diff, if diff == 1 { "" } else { "s" });
+    }
+    diff = (diff + 30) / 60;
+    if diff < 36 {
+        return format!("{} hour{} ago", diff, if diff == 1 { "" } else { "s" });
+    }
+    diff = (diff + 12) / 24;
+    if diff < 14 {
+        return format!("{} day{} ago", diff, if diff == 1 { "" } else { "s" });
+    }
+    if diff < 70 {
+        let w = (diff + 3) / 7;
+        return format!("{} week{} ago", w, if w == 1 { "" } else { "s" });
+    }
+    if diff < 365 {
+        let m = (diff + 15) / 30;
+        return format!("{} month{} ago", m, if m == 1 { "" } else { "s" });
+    }
+    if diff < 1825 {
+        let totalmonths = (diff * 12 * 2 + 365) / (365 * 2);
+        let years = totalmonths / 12;
+        let months = totalmonths % 12;
+        if months > 0 {
+            return format!(
+                "{} year{}, {} month{} ago",
+                years,
+                if years == 1 { "" } else { "s" },
+                months,
+                if months == 1 { "" } else { "s" }
+            );
+        }
+        return format!("{} year{} ago", years, if years == 1 { "" } else { "s" });
+    }
+    let y = (diff + 183) / 365;
+    format!("{} year{} ago", y, if y == 1 { "" } else { "s" })
+}
+
+/// civil-from-days + days-from-civil (Howard Hinnant's algorithm).
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+fn tz_offset_seconds(tz: &str) -> i64 {
+    // "+HHMM" / "-HHMM"
+    if tz.len() != 5 {
+        return 0;
+    }
+    let sign = if tz.starts_with('-') { -1 } else { 1 };
+    let h: i64 = tz[1..3].parse().unwrap_or(0);
+    let m: i64 = tz[3..5].parse().unwrap_or(0);
+    sign * (h * 3600 + m * 60)
+}
+
+fn iso_date(ts: i64, tz: &str, strict: bool) -> String {
+    let t = ts + tz_offset_seconds(tz);
+    let days = t.div_euclid(86400);
+    let secs = t.rem_euclid(86400);
+    let (y, m, d) = civil_from_days(days);
+    let (hh, mm, ss) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    if strict {
+        format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{}:{}", y, m, d, hh, mm, ss, &tz[..3].replace("+", "+").replace("-", "-"), &tz[3..])
+    } else {
+        format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02} {}", y, m, d, hh, mm, ss, tz)
+    }
+}
+
+fn rfc_date(ts: i64, tz: &str) -> String {
+    const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    const MON: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let t = ts + tz_offset_seconds(tz);
+    let days = t.div_euclid(86400);
+    let secs = t.rem_euclid(86400);
+    let (y, m, d) = civil_from_days(days);
+    let dow = DAYS[days.rem_euclid(7) as usize];
+    format!(
+        "{}, {} {} {} {:02}:{:02}:{:02} {}",
+        dow,
+        d,
+        MON[(m - 1) as usize],
+        y,
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60,
+        tz
+    )
+}
+
+fn short_date(ts: i64, tz: &str) -> String {
+    let t = ts + tz_offset_seconds(tz);
+    let (y, m, d) = civil_from_days(t.div_euclid(86400));
+    format!("{:04}-{:02}-{:02}", y, m, d)
+}
+
+/// strftime subset: %Y %m %d %H %M %S %a %b %B %e %T %F %z %Z %s %j %U %G
+fn strftime_like(fmt: &str, ts: i64, tz: &str) -> String {
+    const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    const DAYS_L: [&str; 7] = [
+        "Thursday", "Friday", "Saturday", "Sunday", "Monday", "Tuesday", "Wednesday",
+    ];
+    const MON: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    const MON_L: [&str; 12] = [
+        "January", "February", "March", "April", "May", "June", "July", "August",
+        "September", "October", "November", "December",
+    ];
+    let t = ts + tz_offset_seconds(tz);
+    let days = t.div_euclid(86400);
+    let secs = t.rem_euclid(86400);
+    let (y, mo, d) = civil_from_days(days);
+    let (hh, mm, ss) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    let doy = {
+        // day of year
+        let mut acc = d;
+        const MD: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+        for k in 1..mo {
+            acc += MD[(k - 1) as usize];
+            if k == 2 && (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)) {
+                acc += 1;
+            }
+        }
+        acc
+    };
+    let mut out = String::new();
+    let mut it = fmt.chars().peekable();
+    while let Some(c) = it.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match it.next() {
+            Some('Y') => out.push_str(&format!("{:04}", y)),
+            Some('y') => out.push_str(&format!("{:02}", y.rem_euclid(100))),
+            Some('m') => out.push_str(&format!("{:02}", mo)),
+            Some('d') => out.push_str(&format!("{:02}", d)),
+            Some('e') => out.push_str(&format!("{:2}", d)),
+            Some('H') => out.push_str(&format!("{:02}", hh)),
+            Some('M') => out.push_str(&format!("{:02}", mm)),
+            Some('S') => out.push_str(&format!("{:02}", ss)),
+            Some('a') => out.push_str(DAYS[days.rem_euclid(7) as usize]),
+            Some('A') => out.push_str(DAYS_L[days.rem_euclid(7) as usize]),
+            Some('b') | Some('h') => out.push_str(MON[(mo - 1) as usize]),
+            Some('B') => out.push_str(MON_L[(mo - 1) as usize]),
+            Some('T') => out.push_str(&format!("{:02}:{:02}:{:02}", hh, mm, ss)),
+            Some('F') => out.push_str(&format!("{:04}-{:02}-{:02}", y, mo, d)),
+            Some('j') => out.push_str(&format!("{:03}", doy)),
+            Some('z') => out.push_str(tz),
+            Some('s') => out.push_str(&format!("{}", ts)),
+            Some('%') => out.push('%'),
+            Some(other) => {
+                out.push('%');
+                out.push(other);
+            }
+            None => out.push('%'),
+        }
+    }
+    out
+}
+
+/// `--pretty=<fmt>`/`--format=<fmt>` commit rendering. Supports the
+/// named presets (oneline/short/medium/full/fuller/reference/raw) and
+/// %-placeholder format strings.
+pub fn pretty_commit(
+    repo: &Repo,
+    oid: &Oid,
+    fmt: &str,
+    decorations: &BTreeMap<Oid, Vec<String>>,
+    abbrev: bool,
+    date_mode: &str,
+) -> Result<String> {
+    let c = crate::revwalk::load_commit(repo, oid)?;
+    let hid = |o: &Oid| if abbrev { o.short(7) } else { o.hex() };
+    let mut out = String::new();
+    // format:/tformat: prefix → hand the inner string to the %-engine
+    let fmt = fmt
+        .strip_prefix("format:")
+        .or_else(|| fmt.strip_prefix("tformat:"))
+        .unwrap_or(fmt);
+    match fmt {
+        "medium" => {
+            out.push_str(&format!("commit {}", hid(oid)));
+            if let Some(d) = decorations.get(oid) {
+                out.push_str(&format!(" ({})", d.join(", ")));
+            }
+            if c.parents.len() > 1 {
+                out.push_str(&format!(
+                    "\nMerge: {}",
+                    c.parents
+                        .iter()
+                        .map(|p| p.short(7))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                ));
+            }
+            out.push_str(&format!("\nAuthor: {}", c.author.who()));
+            out.push_str(&format!(
+                "\nDate:   {}\n\n",
+                format_date_mode(c.author.time, &c.author.tz, date_mode)
+            ));
+            for l in c.message.trim_end_matches('\n').lines() {
+                out.push_str(&format!("    {}\n", l));
+            }
+        }
+        "oneline" => {
+            let dec = decorations
+                .get(oid)
+                .map(|d| format!(" ({})", d.join(", ")))
+                .unwrap_or_default();
+            out.push_str(&format!("{}{} {}", hid(oid), dec, c.summary()));
+        }
+        "short" | "full" | "fuller" | "raw" => {
+            let dec = decorations
+                .get(oid)
+                .map(|d| format!(" ({})", d.join(", ")))
+                .unwrap_or_default();
+            out.push_str(&format!("commit {}{}\n", hid(oid), dec));
+            if fmt == "raw" {
+                // raw object text: headers as stored, message indented
+                let raw_bytes = c.serialize();
+                let raw = String::from_utf8_lossy(&raw_bytes);
+                if let Some(pos) = raw.find("\n\n") {
+                    out.push_str(&raw[..pos]);
+                    out.push_str("\n\n");
+                    for l in raw[pos + 2..].trim_end_matches('\n').lines() {
+                        out.push_str(&format!("    {}\n", l));
+                    }
+                } else {
+                    out.push_str(&raw);
+                }
+            } else {
+                if c.parents.len() > 1 {
+                    out.push_str(&format!(
+                        "Merge: {}\n",
+                        c.parents
+                            .iter()
+                            .map(|p| p.short(7))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    ));
+                }
+                match fmt {
+                    "short" => {
+                        out.push_str(&format!("Author: {}\n\n", c.author.who()));
+                        for l in c.summary().lines() {
+                            out.push_str(&format!("    {}\n", l));
+                        }
+                    }
+                    "full" => {
+                        out.push_str(&format!(
+                            "Author: {}\nCommit: {}\n\n",
+                            c.author.who(),
+                            c.committer.who()
+                        ));
+                        for l in c.message.trim_end_matches('\n').lines() {
+                            out.push_str(&format!("    {}\n", l));
+                        }
+                    }
+                    _ => {
+                        out.push_str(&format!(
+                            "Author:     {}\nAuthorDate: {}\nCommit:     {}\nCommitDate: {}\n\n",
+                            c.author.who(),
+                            format_date_mode(c.author.time, &c.author.tz, date_mode),
+                            c.committer.who(),
+                            format_date_mode(c.committer.time, &c.committer.tz, date_mode)
+                        ));
+                        for l in c.message.trim_end_matches('\n').lines() {
+                            out.push_str(&format!("    {}\n", l));
+                        }
+                    }
+                }
+            }
+        }
+        "reference" => {
+            let dec = decorations
+                .get(oid)
+                .map(|d| format!(" ({})", d.join(", ")))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "{} ({}, {})",
+                oid.short(7),
+                c.summary().trim_end().to_string() + &dec,
+                format_date_mode(c.author.time, &c.author.tz, "short")
+            ));
+        }
+        _ => {
+            // %-placeholder expansion
+            let mut it = fmt.chars().peekable();
+            while let Some(ch) = it.next() {
+                if ch != '%' {
+                    out.push(ch);
+                    continue;
+                }
+                let Some(k) = it.next() else { break };
+                let s = match k {
+                    'H' => oid.hex(),
+                    'h' => oid.short(7),
+                    'T' => c.tree.hex(),
+                    't' => c.tree.short(7),
+                    'P' => c.parents.iter().map(|p| p.hex()).collect::<Vec<_>>().join(" "),
+                    'p' => c.parents.iter().map(|p| p.short(7)).collect::<Vec<_>>().join(" "),
+                    's' => c.summary(),
+                    'f' => sanitize_subject(&c.summary()),
+                    'b' => body_of(&c.message),
+                    'B' => c.message.clone(),
+                    'e' => c
+                        .extra_headers
+                        .iter()
+                        .find(|(k, _)| k == "encoding")
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or_default(),
+                    'd' => decorations
+                        .get(oid)
+                        .map(|d| format!(" ({})", d.join(", ")))
+                        .unwrap_or_default(),
+                    'D' => decorations
+                        .get(oid)
+                        .map(|d| d.join(", "))
+                        .unwrap_or_default(),
+                    'n' => "\n".to_string(),
+                    '%' => "%".to_string(),
+                    'a' | 'c' => {
+                        let sub = it.next().unwrap_or(' ');
+                        let id = if k == 'a' { &c.author } else { &c.committer };
+                        match sub {
+                            'n' => id.name.clone(),
+                            'e' => id.email.clone(),
+                            'd' => format_date_mode(id.time, &id.tz, date_mode),
+                            'D' => format_date_mode(id.time, &id.tz, "rfc"),
+                            'r' => relative_date(id.time),
+                            't' => format!("{}", id.time),
+                            'i' => format_date_mode(id.time, &id.tz, "iso"),
+                            'I' => format_date_mode(id.time, &id.tz, "iso-strict"),
+                            's' => format_date_mode(id.time, &id.tz, "short"),
+                            _ => String::new(),
+                        }
+                    }
+                    'N' => String::new(), // notes — unsupported
+                    'm' => ">".to_string(), // boundary mark — unsupported
+                    'x' => {
+                        // %xNN hex escape
+                        let h: String = it.by_ref().take(2).collect();
+                        u8::from_str_radix(&h, 16)
+                            .map(|b| (b as char).to_string())
+                            .unwrap_or_default()
+                    }
+                    'w' => {
+                        // %w(...) wrapping — emit inner literally
+                        if it.peek() == Some(&'(') {
+                            it.next();
+                            let mut depth = 1;
+                            let mut inner = String::new();
+                            for c2 in it.by_ref() {
+                                if c2 == '(' {
+                                    depth += 1;
+                                } else if c2 == ')' {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        break;
+                                    }
+                                }
+                                inner.push(c2);
+                            }
+                            inner
+                        } else {
+                            String::new()
+                        }
+                    }
+                    other => {
+                        out.push('%');
+                        other.to_string()
+                    }
+                };
+                out.push_str(&s);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn body_of(msg: &str) -> String {
+    let mut lines = msg.lines();
+    let mut past_blank = false;
+    let mut out = Vec::new();
+    // skip subject + the blank separator
+    for l in lines.by_ref() {
+        if l.trim().is_empty() {
+            past_blank = true;
+            break;
+        }
+    }
+    if !past_blank {
+        return String::new();
+    }
+    for l in lines {
+        out.push(l);
+    }
+    out.join("\n")
+}
+
+/// %f: subject sanitized for filenames (git's algorithm: collapse
+/// non-alnum runs to '-', trim '-').
+fn sanitize_subject(s: &str) -> String {
+    let mut out = String::new();
+    let mut dash = false;
+    for c in s.trim().chars() {
+        if c.is_ascii_alphanumeric() || c == '.' || c == '_' {
+            out.push(c);
+            dash = false;
+        } else if !dash {
+            out.push('-');
+            dash = true;
+        }
+    }
+    out.trim_matches('-').to_string()
 }
 
 /// Should we print ref decorations? git's --decorate defaults to "auto":

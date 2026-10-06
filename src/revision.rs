@@ -260,6 +260,23 @@ fn resolve_base(repo: &Repo, base: &str) -> Result<Oid> {
         }
     }
 
+    // unborn branch gets git's friendlier message
+    if (base == "HEAD" || base == "@")
+        && matches!(repo.read_head(), Ok(crate::repo::Head::Symbolic(_)))
+        && repo.head_oid().ok().flatten().is_none()
+    {
+        let br = match repo.read_head() {
+            Ok(crate::repo::Head::Symbolic(t)) => t
+                .strip_prefix("refs/heads/")
+                .unwrap_or(&t)
+                .to_string(),
+            _ => "HEAD".to_string(),
+        };
+        return Err(GitError::InvalidInput(format!(
+            "fatal: your current branch '{}' does not have any commits yet",
+            br
+        )));
+    }
     Err(GitError::InvalidInput(format!(
         "{}: ambiguous argument '{}': unknown revision or path not in the working tree.",
         base, base

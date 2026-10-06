@@ -61,10 +61,18 @@ Creates real stash commits (`refs/stash` + reflog) that `git stash` can pop.
 
 ## History & inspection
 
-### `qel log [--oneline] [-n|-N|--max-count=N] [-p|--patch] [--stat] [--name-only|--name-status] [--all] [--follow] [-- <path>]`
-### `qel show [<rev>]` · `qel diff [--cached|--staged] [<rev> [<rev>]] [-- <path>]`
+### `qel log [--oneline] [-n|-N|--max-count=N] [-p|--patch] [--stat] [--name-only|--name-status] [--summary] [-m] [--pretty[=<fmt>]|--format=<fmt>] [--date=<fmt>] [--abbrev-commit] [--all] [--follow] [-- <path>]`
+### `qel show [--patch|--no-patch|--stat|--shortstat|--numstat|--name-only|--name-status|--summary] [-m|--cc|--first-parent] [--pretty[=<fmt>]|--format=<fmt>] [--date=<fmt>] [--abbrev-commit] [<rev>...]` · `qel diff [--cached|--staged] [<rev> [<rev>]] [-- <path>]`
 Diff output (headers, `index` lines, hunk markers, mode changes, new/deleted
-files, binary notices) is byte-identical to git for tested cases.
+files, binary notices) is byte-identical to git for tested cases. Merge
+commits follow git's rules: `--stat`/`--numstat`/`--summary` diff against the
+first parent, patch and name views use the combined diff, `-m` emits one
+block per parent. `--pretty` supports the named presets
+(`oneline|short|medium|full|fuller|raw|reference`) plus `format:`/`tformat:`
+placeholder strings (`%H %h %T %t %P %p %an %ae %ad %aD %ar %at %ai %aI %as
+%cn %ce %cd %cD %cr %ct %ci %cI %cs %s %f %b %B %e %d %D %n %xNN %w(...)`),
+with `--date=` covering `default|relative|iso|iso-strict|rfc|short|raw|unix|
+format:<strftime>` — the relative algorithm matches git's bucketing exactly.
 ### `qel blame <file>` · `qel annotate <file>` · `qel grep [-n] [-l] <pattern> [<rev>] [-- <path>]`
 ### `qel describe [--tags] [--always] [<rev>]` · `qel name-rev <rev>` · `qel shortlog [-s|-n]`
 ### `qel reflog [<ref>]` — `@{0}` is newest, matching git.
@@ -165,7 +173,7 @@ not implemented.
 | `symbolic-ref [-d] [<name> [<target>]]` | read/write symrefs |
 | `ls-files [-s|--stage] [-c|-m|-d|-o|-u] [-- <path>]` | index listing (`-s` byte-identical) |
 | `ls-tree [-r] [-d] [--name-only] <tree-ish> [<path>]` | tree listing |
-| `for-each-ref [--format=<fmt>] [<pattern>]` | ⚠ `%()` fields subset |
+| `for-each-ref [--format=<fmt>] [--sort=<key>] [--count=N] [--points-at=<rev>] [--merged=<rev>] [--no-merged=<rev>] [--contains=<rev>] [--no-contains=<rev>] [--ignore-case] [--omit-empty] [--date=<fmt>] [<pattern>]` | `%()` atoms: refname(:short/:lstrip/:rstrip), objectname(:short), objecttype, objectsize, symref, upstream(:short), push, HEAD, subject, body, contents(:subject/:body), tag, tagger*, author*, committer*, creator(date), tree, parent, numparent, `*`peeled; `%% %n %t %xNN %09` escapes; fnmatch patterns |
 | `show-ref [--heads|--tags] [-d|--dereference] [<pattern>]` | refs dump |
 | `verify-pack [-v] <idx>` | check a pack + idx |
 | `index-pack [--stdin] <pack>` | store a pack + write idx |

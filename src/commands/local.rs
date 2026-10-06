@@ -877,7 +877,12 @@ fn cmd_log(args: &[String]) -> Result<i32> {
     let mut stat = false;
     let mut name_only = false;
     let mut name_status = false;
+    let mut summary_only = false;
     let mut follow = false;
+    let mut mflag = false;
+    let mut pretty: Option<String> = None;
+    let mut abbrev_commit = false;
+    let mut date_mode = String::new();
     let mut spec = "HEAD".to_string();
     let mut paths: Vec<String> = Vec::new();
     let mut i = 0;
@@ -890,9 +895,11 @@ fn cmd_log(args: &[String]) -> Result<i32> {
                 max = args.get(i).and_then(|s| s.parse().ok());
             }
             "-p" | "-u" | "--patch" => patch = true,
+            "-m" => mflag = true,
             "--stat" => stat = true,
             "--name-only" => name_only = true,
             "--name-status" => name_status = true,
+            "--summary" => summary_only = true,
             "--follow" => follow = true,
             "--all" => {
                 spec = "--all".to_string();
@@ -903,6 +910,25 @@ fn cmd_log(args: &[String]) -> Result<i32> {
             }
             s if s.starts_with("--max-count=") => {
                 max = s["--max-count=".len()..].parse().ok();
+            }
+            "--abbrev-commit" => abbrev_commit = true,
+            s if s.starts_with("--pretty") || s.starts_with("--format") => {
+                let v = if let Some(eq) = s.find('=') {
+                    s[eq + 1..].to_string()
+                } else {
+                    "medium".to_string()
+                };
+                pretty = Some(if s.starts_with("--format")
+                    && !v.starts_with("tformat:")
+                    && !v.starts_with("format:")
+                {
+                    format!("tformat:{}", v)
+                } else {
+                    v
+                });
+            }
+            s if s.starts_with("--date=") => {
+                date_mode = s["--date=".len()..].to_string();
             }
             s if s.len() > 1
                 && s.starts_with('-')
@@ -963,6 +989,7 @@ fn cmd_log(args: &[String]) -> Result<i32> {
         BTreeMap::new()
     };
     let mut out = String::new();
+    let user_fmt = pretty.as_deref();
     for (n, oid) in commits.iter().enumerate() {
         let c = revwalk::load_commit(&repo, oid)?;
         if oneline {
@@ -973,46 +1000,83 @@ fn cmd_log(args: &[String]) -> Result<i32> {
             out.push_str(&format!("{}{} {}\n", oid.short(7), dec, c.summary()));
             continue;
         }
+        if let Some(f) = user_fmt {
+            let body = pretty_commit(&repo, oid, f, &decs, abbrev_commit, &date_mode)?;
+            out.push_str(&body);
+            // terminator semantics for tformat:/bare strings/oneline/
+            // reference; separator \n between entries for format: and the
+            // block presets (whose bodies already end in \n)
+            let terminator = f.starts_with("tformat:")
+                || f == "oneline"
+                || f == "reference"
+                || (!f.starts_with("format:") && f.contains('%'));
+            let last = n + 1 == commits.len();
+            if terminator {
+                out.push('\n');
+            } else if !last {
+                out.push('\n');
+            }
+            continue;
+        }
+        let m_merge = mflag && c.parents.len() > 1
+            && (patch || stat || name_only || name_status || summary_only);
+        if m_merge {
+            if n > 0 {
+                out.push('\n');
+            }
+            // -m: full medium block per parent, "commit X (from P)" style
+            for (pi, p) in c.parents.iter().enumerate() {
+                if pi > 0 {
+                    out.push('\n');
+                }
+                out.push_str(&format!("commit {} (from {})\n", oid.hex(), p.hex()));
+                out.push_str(&format!(
+                    "Merge: {}\n",
+                    c.parents
+                        .iter()
+                        .map(|x| x.short(7))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                ));
+                out.push_str(&format!("Author: {}\n", c.author.who()));
+                out.push_str(&format!(
+                    "Date:   {}\n\n",
+                    if date_mode.is_empty() {
+                        crate::repo::format_git_date(c.author.time, &c.author.tz)
+                    } else {
+                        format_date_mode(c.author.time, &c.author.tz, &date_mode)
+                    }
+                ));
+                for l in c.message.trim_end_matches('\n').lines() {
+                    out.push_str(&format!("    {}\n", l));
+                }
+                out.push('\n');
+                let old_map = commit_map(&repo, p)?;
+                let new_map = commit_map(&repo, oid)?;
+                out.push_str(&emit_diff_block(
+                    &repo, &old_map, &new_map, stat, false, false, name_only,
+                    name_status, patch, false,
+                )?);
+            }
+            continue;
+        }
         if n > 0 {
             out.push('\n');
         }
-        out.push_str(&format_commit(&repo, oid, &decs)?);
-        if patch || stat || name_only || name_status {
-            let old_map = match c.parents.first() {
-                Some(p) => commit_map(&repo, p)?,
-                None => BTreeMap::new(),
-            };
-            let new_map = commit_map(&repo, oid)?;
-            let changes = tree::diff_flat_maps(&old_map, &new_map);
-            if stat {
-                for (p, ch) in &changes {
-                    let (ins, del) = count_changes(&repo, ch);
-                    out.push_str(&format!(" {} | {} +-\n", p, ins + del));
-                }
-                out.push_str(&format!(
-                    " {} file{} changed\n",
-                    changes.len(),
-                    if changes.len() == 1 { "" } else { "s" }
-                ));
-            }
-            if name_only {
-                for (p, _) in &changes {
-                    out.push_str(&format!("{}\n", p));
-                }
-            }
-            if name_status {
-                for (p, ch) in &changes {
-                    let code = match ch {
-                        tree::TreeDiff::Added(..) => 'A',
-                        tree::TreeDiff::Deleted(..) => 'D',
-                        tree::TreeDiff::Modified(..) => 'M',
-                    };
-                    out.push_str(&format!("{}\t{}\n", code, p));
-                }
-            }
-            if patch {
+        out.push_str(&format_commit_dm(&repo, oid, &decs, &date_mode)?);
+        if patch || stat || name_only || name_status || summary_only {
+            // log uses combined-diff semantics: clean merges show nothing
+            if c.parents.len() < 2 {
                 out.push('\n');
-                out.push_str(&patch_between_maps(&repo, &old_map, &new_map));
+                let old_map = match c.parents.first() {
+                    Some(p) => commit_map(&repo, p)?,
+                    None => BTreeMap::new(),
+                };
+                let new_map = commit_map(&repo, oid)?;
+                out.push_str(&emit_diff_block(
+                    &repo, &old_map, &new_map, stat, false, false, name_only,
+                    name_status, patch, summary_only,
+                )?);
             }
         }
     }
@@ -1035,55 +1099,311 @@ fn count_changes(repo: &Repo, ch: &tree::TreeDiff) -> (usize, usize) {
 
 fn cmd_show(args: &[String]) -> Result<i32> {
     let repo = get_repo()?;
-    let spec = args
-        .iter()
-        .find(|a| !a.starts_with('-'))
-        .cloned()
-        .unwrap_or_else(|| "HEAD".to_string());
-    let oid = revision::rev_parse(&repo, &spec)?;
-    let obj = repo.odb.read(&oid)?;
-    match obj.0 {
-        ObjType::Commit => {
-            let decs = if want_decorations(args) {
-                decorations(&repo)?
-            } else {
-                BTreeMap::new()
-            };
-            print!("{}", format_commit(&repo, &oid, &decs)?);
-            let c = revwalk::load_commit(&repo, &oid)?;
-            let old_map = match c.parents.first() {
-                Some(p) => commit_map(&repo, p)?,
-                None => BTreeMap::new(),
-            };
-            let new_map = commit_map(&repo, &oid)?;
-            print!("{}", patch_between_maps(&repo, &old_map, &new_map));
-        }
-        ObjType::Tag => {
-            let t = Tag::parse(&obj.1)?;
-            println!("tag {}", t.tag);
-            if let Some(tg) = &t.tagger {
-                println!("Tagger: {}", tg.who());
+    let mut stat = false;
+    let mut shortstat = false;
+    let mut numstat = false;
+    let mut name_only = false;
+    let mut name_status = false;
+    let mut summary_only = false;
+    let mut patch: Option<bool> = None;
+    let mut pretty: Option<String> = None;
+    let mut abbrev_commit = false;
+    let mut date_mode = String::new();
+    let mut first_parent_diff = false;
+    let mut mflag = false;
+    let mut specs: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--stat" => stat = true,
+            "--shortstat" => shortstat = true,
+            "--numstat" => numstat = true,
+            "--name-only" => name_only = true,
+            "--name-status" => name_status = true,
+            "--summary" => summary_only = true,
+            "-p" | "-u" | "--patch" => patch = Some(true),
+            "--no-patch" | "-s" => patch = Some(false),
+            "--abbrev-commit" => abbrev_commit = true,
+            "--no-abbrev-commit" => abbrev_commit = false,
+            "--oneline" => {
+                pretty = Some("oneline".into());
+                abbrev_commit = true;
             }
-            println!();
-            print!("{}", t.message);
-            // then show the target commit like git does
-            let target = repo.odb.read(&t.object)?;
-            if target.0 == ObjType::Commit {
-                let decs = decorations(&repo)?;
-                print!("{}", format_commit(&repo, &t.object, &decs)?);
+            "-m" => mflag = true,
+            "--first-parent" => first_parent_diff = true,
+            "--cc" => {} // combined diff = default merge behavior
+            s if s.starts_with("--pretty") || s.starts_with("--format") => {
+                let v = if let Some(eq) = s.find('=') {
+                    s[eq + 1..].to_string()
+                } else {
+                    "medium".to_string()
+                };
+                // git: --format=X ≣ --pretty=tformat:X (terminator); only
+                // --pretty=format: uses pure separator semantics (no blank
+                // line between the commit block and the diff)
+                if s.starts_with("--format") && !v.starts_with("tformat:") && !v.starts_with("format:") {
+                    pretty = Some(format!("tformat:{}", v));
+                } else {
+                    pretty = Some(v);
+                }
             }
-        }
-        ObjType::Tree => {
-            for e in crate::object::parse_tree(&obj.1)? {
-                println!("{}", e.name);
+            s if s.starts_with("--date=") => {
+                date_mode = s["--date=".len()..].to_string();
             }
+            s if !s.starts_with('-') => specs.push(s.to_string()),
+            _ => {}
         }
-        ObjType::Blob => {
-            use std::io::Write;
-            std::io::stdout().write_all(&obj.1)?;
+        i += 1;
+    }
+    if specs.is_empty() {
+        specs.push("HEAD".to_string());
+    }
+    // any explicit diff view suppresses patch unless -p also given
+    let any_view = stat || shortstat || numstat || name_only || name_status || summary_only;
+    let show_patch = match patch {
+        Some(p) => p,
+        None => !any_view,
+    };
+    let decs = if want_decorations(args) {
+        decorations(&repo)?
+    } else {
+        BTreeMap::new()
+    };
+    for spec in &specs {
+        let oid = revision::rev_parse(&repo, spec)?;
+        let obj = repo.odb.read(&oid)?;
+        match obj.0 {
+            ObjType::Commit => {
+                print_commit_show(
+                    &repo, &oid, &pretty, abbrev_commit, &date_mode, &decs, stat, shortstat,
+                    numstat, name_only, name_status, summary_only, show_patch, first_parent_diff,
+                    mflag,
+                )?;
+            }
+            ObjType::Tag => {
+                let t = Tag::parse(&obj.1)?;
+                println!("tag {}", t.tag);
+                if let Some(tg) = &t.tagger {
+                    println!("Tagger: {}", tg.who());
+                    println!(
+                        "Date:   {}",
+                        format_date_mode(tg.time, &tg.tz, &date_mode)
+                    );
+                }
+                println!();
+                print!("{}", t.message);
+                if !t.message.ends_with('\n') {
+                    println!();
+                }
+                println!();
+                // then show the peeled target like git does
+                let target = repo.odb.read(&t.object)?;
+                match target.0 {
+                    ObjType::Commit => {
+                        print_commit_show(
+                            &repo, &t.object, &pretty, abbrev_commit, &date_mode, &decs, stat,
+                            shortstat, numstat, name_only, name_status, summary_only, show_patch,
+                            first_parent_diff, mflag,
+                        )?;
+                    }
+                    ObjType::Tree => {
+                        show_tree(&repo, &t.object, spec)?;
+                    }
+                    _ => {}
+                }
+            }
+            ObjType::Tree => {
+                show_tree(&repo, &oid, spec)?;
+            }
+            ObjType::Blob => {
+                use std::io::Write;
+                std::io::stdout().write_all(&obj.1)?;
+            }
         }
     }
     Ok(0)
+}
+
+fn print_commit_show(
+    repo: &Repo,
+    oid: &Oid,
+    pretty: &Option<String>,
+    abbrev_commit: bool,
+    date_mode: &str,
+    decs: &BTreeMap<Oid, Vec<String>>,
+    stat: bool,
+    shortstat: bool,
+    numstat: bool,
+    name_only: bool,
+    name_status: bool,
+    summary_only: bool,
+    show_patch: bool,
+    first_parent_diff: bool,
+    mflag: bool,
+) -> Result<()> {
+    let c = revwalk::load_commit(repo, oid)?;
+    // -m on a merge: one block per parent, each "commit <oid> (from <p>)"
+    if mflag && c.parents.len() > 1 {
+        for (pi, p) in c.parents.iter().enumerate() {
+            if pi > 0 {
+                println!();
+            }
+            println!("commit {} (from {})", oid.hex(), p.hex());
+            println!(
+                "Merge: {}",
+                c.parents
+                    .iter()
+                    .map(|x| x.short(7))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+            println!("Author: {}", c.author.who());
+            println!(
+                "Date:   {}",
+                if date_mode.is_empty() {
+                    crate::repo::format_git_date(c.author.time, &c.author.tz)
+                } else {
+                    format_date_mode(c.author.time, &c.author.tz, date_mode)
+                }
+            );
+            println!();
+            for l in c.message.trim_end_matches('\n').lines() {
+                println!("    {}", l);
+            }
+            println!();
+            let old_map = commit_map(repo, p)?;
+            let new_map = commit_map(repo, oid)?;
+            if stat || shortstat || numstat || name_only || name_status || summary_only {
+                print!("{}", emit_diff_block(repo, &old_map, &new_map,
+                    stat, shortstat, numstat, name_only, name_status, false, summary_only)?);
+            } else if show_patch {
+                print!("{}", patch_between_maps(repo, &old_map, &new_map));
+            }
+        }
+        return Ok(());
+    }
+    let mut sep_done = false;
+    match pretty.as_deref() {
+        Some(f) => {
+            // tformat:/named presets get the blank separator before the
+            // diff; bare format: (separator semantics) does not
+            let term_blank = f.starts_with("tformat:")
+                || (!f.starts_with("format:") && !f.contains('%'));
+            let body = pretty_commit(repo, oid, f, decs, abbrev_commit, date_mode)?;
+            print!("{}", body);
+            if !body.ends_with('\n') {
+                println!();
+            }
+            if term_blank && (show_patch || stat || shortstat || numstat
+                || name_only || name_status || summary_only)
+            {
+                println!();
+                sep_done = true;
+            }
+            // pure format: → separator semantics: nothing extra before diff
+            if f.starts_with("format:") {
+                sep_done = true;
+            }
+        }
+        None => {
+            if !abbrev_commit {
+                print!("{}", format_commit_dm(repo, oid, decs, date_mode)?);
+            } else {
+                // --abbrev-commit: medium with short oid, no trailing blank
+                print!("{}", pretty_commit(repo, oid, "medium", decs, true, date_mode)?);
+            }
+        }
+    }
+    // merge commit handling: --stat family diffs vs first parent; patch and
+    // name-* use the combined diff (only paths differing from ALL parents)
+    let merge = c.parents.len() > 1;
+    let new_map = commit_map(repo, oid)?;
+    let want_stat_view = stat || shortstat || numstat || summary_only;
+    let want_name_view = name_only || name_status;
+    if merge && !first_parent_diff && (want_stat_view) {
+        // falls through to first-parent diff below
+    } else if merge && !first_parent_diff {
+        let parents: Vec<BTreeMap<String, (u32, Oid)>> = c
+            .parents
+            .iter()
+            .map(|p| commit_map(repo, p))
+            .collect::<Result<_>>()?;
+        let combined = combined_diff_nonempty(&parents, &new_map);
+        if show_patch || want_name_view {
+            if !sep_done {
+                println!();
+            }
+            if combined {
+                let old_map = commit_map(repo, &c.parents[0])?;
+                if want_name_view && !show_patch {
+                    print!("{}", emit_diff_block(repo, &old_map, &new_map,
+                        false, false, false, name_only, name_status, false, false)?);
+                } else {
+                    print!("{}", patch_between_maps(repo, &old_map, &new_map));
+                }
+            }
+        }
+        return Ok(());
+    }
+    let old_map = match c.parents.first() {
+        Some(p) => commit_map(repo, p)?,
+        None => BTreeMap::new(),
+    };
+    if want_stat_view || want_name_view {
+        let block = emit_diff_block(
+            repo, &old_map, &new_map, stat, shortstat, numstat,
+            name_only, name_status, false, summary_only,
+        )?;
+        if !block.is_empty() {
+            if !sep_done {
+                println!();
+            }
+            print!("{}", block);
+        }
+    } else if show_patch {
+        if !sep_done {
+            println!();
+        }
+        print!("{}", patch_between_maps(repo, &old_map, &new_map));
+    }
+    Ok(())
+}
+
+/// Paths whose result entry differs from every parent's entry
+/// (git's --cc filter for merge diffs).
+fn combined_changes(
+    parents: &[BTreeMap<String, (u32, Oid)>],
+    new_map: &BTreeMap<String, (u32, Oid)>,
+) -> Vec<String> {
+    let mut paths = std::collections::BTreeSet::new();
+    paths.extend(new_map.keys().cloned());
+    for m in parents {
+        paths.extend(m.keys().cloned());
+    }
+    paths
+        .into_iter()
+        .filter(|p| {
+            let n = new_map.get(p);
+            parents.iter().all(|m| m.get(p) != n)
+        })
+        .collect()
+}
+
+fn combined_diff_nonempty(
+    parents: &[BTreeMap<String, (u32, Oid)>],
+    new_map: &BTreeMap<String, (u32, Oid)>,
+) -> bool {
+    !combined_changes(parents, new_map).is_empty()
+}
+
+fn show_tree(repo: &Repo, oid: &Oid, spec: &str) -> Result<()> {
+    println!("tree {}", spec);
+    println!();
+    let obj = repo.odb.read(oid)?;
+    for e in crate::object::parse_tree(&obj.1)? {
+        println!("{}", e.name);
+    }
+    Ok(())
 }
 
 // ============================== diff ==============================
@@ -1223,6 +1543,152 @@ fn cmd_diff(args: &[String]) -> Result<i32> {
     }
     print!("{}", out);
     Ok(0)
+}
+
+/// Render one commit-vs-parent diff in the requested output modes
+/// (git stat/numstat/name-only/name-status/patch formats).
+fn emit_diff_block(
+    repo: &Repo,
+    old_map: &BTreeMap<String, (u32, Oid)>,
+    new_map: &BTreeMap<String, (u32, Oid)>,
+    stat: bool,
+    shortstat: bool,
+    numstat: bool,
+    name_only: bool,
+    name_status: bool,
+    patch: bool,
+    summary: bool,
+) -> Result<String> {
+    let mut out = String::new();
+    let changes = tree::diff_flat_maps(old_map, new_map);
+    if summary {
+        for (p, ch) in &changes {
+            use tree::TreeDiff::*;
+            match ch {
+                Added(m, _) => out.push_str(&format!(" create mode {:06o} {}\n", m, p)),
+                Deleted(m, _) => out.push_str(&format!(" delete mode {:06o} {}\n", m, p)),
+                Modified(om, _, nm, _) if om != nm => {
+                    out.push_str(&format!(" mode change {:06o} => {:06o} {}\n", om, nm, p))
+                }
+                _ => {}
+            }
+        }
+    }
+    if stat || shortstat || numstat {
+        let mut rows: Vec<(String, usize, usize)> = Vec::new();
+        let (mut ti, mut td) = (0usize, 0usize);
+        for (p, ch) in &changes {
+            let (ins, del) = count_changes(repo, ch);
+            ti += ins;
+            td += del;
+            rows.push((p.clone(), ins, del));
+        }
+        if stat {
+            let max_name = rows.iter().map(|(p, _, _)| p.len()).max().unwrap_or(0);
+            let max_chg = rows
+                .iter()
+                .map(|(_, i, d)| i + d)
+                .max()
+                .unwrap_or(0)
+                .to_string()
+                .len();
+            // git scales the +/- graph to ~50 columns at most
+            let scale = |n: usize, total: usize| -> String {
+                if total > 50 {
+                    let scaled = (n * 50 + total - 1) / total.max(1);
+                    "+".repeat(scaled.min(50))
+                } else {
+                    "+".repeat(n)
+                }
+            };
+            for (p, i, d) in &rows {
+                let pluses = scale(*i, ti + td);
+                let minuses = if ti + td > 50 {
+                    let scaled = (*d * 50 + ti + td - 1) / (ti + td).max(1);
+                    "-".repeat(scaled.min(50))
+                } else {
+                    "-".repeat(*d)
+                };
+                let graph = format!("{}{}", pluses, minuses);
+                if graph.is_empty() {
+                    out.push_str(&format!(
+                        " {:<width$} | {:>cnum$}\n",
+                        p,
+                        i + d,
+                        width = max_name,
+                        cnum = max_chg
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        " {:<width$} | {:>cnum$} {}\n",
+                        p,
+                        i + d,
+                        graph,
+                        width = max_name,
+                        cnum = max_chg
+                    ));
+                }
+            }
+        }
+        if numstat {
+            for (p, i, d) in &rows {
+                out.push_str(&format!("{}\t{}\t{}\n", i, d, p));
+            }
+        }
+        if stat || shortstat {
+            let mut parts = vec![format!(
+                "{} file{} changed",
+                changes.len(),
+                if changes.len() == 1 { "" } else { "s" }
+            )];
+            if ti == 0 && td == 0 {
+                parts.push("0 insertions(+)".to_string());
+                parts.push("0 deletions(-)".to_string());
+            } else {
+                if ti > 0 {
+                    parts.push(format!("{} insertion{}(+)", ti, if ti == 1 { "" } else { "s" }));
+                }
+                if td > 0 {
+                    parts.push(format!("{} deletion{}(-)", td, if td == 1 { "" } else { "s" }));
+                }
+            }
+            out.push_str(&format!(" {}\n", parts.join(", ")));
+        }
+    }
+    if name_only {
+        for (p, _) in &changes {
+            out.push_str(&format!("{}\n", p));
+        }
+    }
+    if name_status {
+        for (p, ch) in &changes {
+            let code = match ch {
+                tree::TreeDiff::Added(..) => 'A',
+                tree::TreeDiff::Deleted(..) => 'D',
+                tree::TreeDiff::Modified(..) => 'M',
+            };
+            out.push_str(&format!("{}\t{}\n", code, p));
+        }
+    }
+    if patch {
+        out.push_str(&patch_between_maps(repo, old_map, new_map));
+    }
+    Ok(out)
+}
+
+/// git's refname:short — strip the standard prefix (ambiguity check
+/// simplified: standard prefixes map to standard short forms).
+fn shorten_ref(repo: &Repo, name: &str) -> String {
+    let _ = repo;
+    if name == "HEAD" {
+        return "HEAD".into();
+    }
+    for p in ["refs/heads/", "refs/tags/", "refs/remotes/"] {
+        if let Some(r) = name.strip_prefix(p) {
+            return r.to_string();
+        }
+    }
+    name.to_string()
 }
 
 /// Build a "map" of the current worktree: tracked files re-hashed on the
@@ -2708,17 +3174,740 @@ fn cmd_merge_file(args: &[String]) -> Result<i32> {
 
 fn cmd_for_each_ref(args: &[String]) -> Result<i32> {
     let repo = get_repo()?;
-    let mut prefix = "refs/".to_string();
-    for a in args {
-        if !a.starts_with('-') {
-            prefix = a.clone();
+    let mut format: Option<String> = None;
+    let mut sort_keys: Vec<(String, bool)> = Vec::new(); // (atom, descending)
+    let mut count: Option<usize> = None;
+    let mut points_at: Option<String> = None;
+    let mut merged: Vec<(bool, String)> = Vec::new(); // (want_merged, rev)
+    let mut contains: Vec<(bool, String)> = Vec::new();
+    let mut ignore_case = false;
+    let mut omit_empty = false;
+    let mut patterns: Vec<String> = Vec::new();
+    let mut date_mode = String::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        let take = |i: &mut usize, args: &[String]| -> Option<String> {
+            *i += 1;
+            args.get(*i).cloned()
+        };
+        match a {
+            "--format" => format = take(&mut i, args),
+            "--sort" => {
+                if let Some(k) = take(&mut i, args) {
+                    push_sort_key(&mut sort_keys, &k);
+                }
+            }
+            "--count" => {
+                count = take(&mut i, args).and_then(|v| v.parse().ok());
+            }
+            "--points-at" => points_at = take(&mut i, args),
+            "--merged" => {
+                if let Some(r) = take(&mut i, args) {
+                    merged.push((true, r));
+                }
+            }
+            "--no-merged" => {
+                if let Some(r) = take(&mut i, args) {
+                    merged.push((false, r));
+                }
+            }
+            "--contains" => {
+                if let Some(r) = take(&mut i, args) {
+                    contains.push((true, r));
+                }
+            }
+            "--no-contains" => {
+                if let Some(r) = take(&mut i, args) {
+                    contains.push((false, r));
+                }
+            }
+            "-i" | "--ignore-case" => ignore_case = true,
+            "--omit-empty" => omit_empty = true,
+            s if s.starts_with("--format=") => format = Some(s["--format=".len()..].into()),
+            s if s.starts_with("--sort=") => {
+                push_sort_key(&mut sort_keys, &s["--sort=".len()..]);
+            }
+            s if s.starts_with("--count=") => {
+                count = s["--count=".len()..].parse().ok();
+            }
+            s if s.starts_with("--points-at=") => {
+                points_at = Some(s["--points-at=".len()..].into());
+            }
+            s if s.starts_with("--merged=") => {
+                merged.push((true, s["--merged=".len()..].into()));
+            }
+            s if s.starts_with("--no-merged=") => {
+                merged.push((false, s["--no-merged=".len()..].into()));
+            }
+            s if s.starts_with("--contains=") => {
+                contains.push((true, s["--contains=".len()..].into()));
+            }
+            s if s.starts_with("--no-contains=") => {
+                contains.push((false, s["--no-contains=".len()..].into()));
+            }
+            s if s.starts_with("--date=") => date_mode = s["--date=".len()..].into(),
+            s if !s.starts_with('-') => patterns.push(s.to_string()),
+            _ => {}
         }
+        i += 1;
     }
-    for (name, oid) in repo.list_refs(&prefix)? {
-        let obj = repo.odb.read(&oid)?;
-        println!("{} {}\t{}", oid.hex(), obj.0.name(), name);
+
+    // pattern → prefix listing + fnmatch filter
+    let prefix = if patterns.is_empty() {
+        "refs/".to_string()
+    } else {
+        // longest literal prefix of the first pattern
+        let p = &patterns[0];
+        match p.find(|c| c == '*' || c == '?' || c == '[') {
+            Some(n) => {
+                let upto = &p[..n];
+                match upto.rfind('/') {
+                    Some(s) => {
+                        let lit = &upto[..s + 1];
+                        if lit.starts_with("refs/") {
+                            lit.to_string()
+                        } else {
+                            "refs/".to_string()
+                        }
+                    }
+                    None => "refs/".to_string(),
+                }
+            }
+            None => {
+                if p.starts_with("refs/") || p == "HEAD" {
+                    p.clone()
+                } else {
+                    format!("refs/{}/", p)
+                }
+            }
+        }
+    };
+    let mut refs = repo.list_refs(&prefix)?;
+    let pat_matched = |name: &str| -> bool {
+        if patterns.is_empty() {
+            return true;
+        }
+        patterns.iter().any(|p| {
+            let p = if p.starts_with("refs/") || p == "HEAD" {
+                p.clone()
+            } else if !p.contains('/') && !p.contains('*') && !p.contains('?') {
+                format!("refs/{}", p)
+            } else {
+                p.clone()
+            };
+            if p.contains('*') || p.contains('?') || p.contains('[') {
+                ref_fnmatch(&p, name, ignore_case)
+            } else {
+                name == p
+                    || name.starts_with(&format!("{}/", p.trim_end_matches('/')))
+            }
+        })
+    };
+    refs.retain(|(n, _)| pat_matched(n));
+
+    // git for-each-ref never lists HEAD (it isn't under refs/)
+
+    // filters needing object knowledge
+    let pa_oid = match &points_at {
+        Some(r) => Some(revision::rev_parse(&repo, r)?),
+        None => None,
+    };
+    // --contains=X: ref tip's ancestry must include X
+    let contains_oids: Vec<(bool, Oid)> = contains
+        .iter()
+        .map(|(want, r)| Ok((*want, revision::rev_parse_commit(&repo, r)?)))
+        .collect::<Result<_>>()?;
+    let merged_sets: Vec<(bool, std::collections::BTreeSet<Oid>)> = merged
+        .iter()
+        .map(|(want, r)| {
+            let tip = revision::rev_parse_commit(&repo, r)?;
+            let mut anc = std::collections::BTreeSet::new();
+            for c in revwalk::rev_list(&repo, &[tip])? {
+                anc.insert(c);
+            }
+            Ok((*want, anc))
+        })
+        .collect::<Result<_>>()?;
+
+    let symref_of = |name: &str| -> Option<String> {
+        for base in [&repo.git_dir, &repo.common_dir] {
+            let p = base.join(name);
+            if p.is_file() {
+                if let Ok(t) = std::fs::read_to_string(&p) {
+                    if let Some(r) = t.trim().strip_prefix("ref:") {
+                        return Some(r.trim().to_string());
+                    }
+                }
+            }
+        }
+        None
+    };
+
+    let mut rows: Vec<(String, Oid)> = Vec::new();
+    'refs: for (name, oid) in refs {
+        if let Some(pa) = &pa_oid {
+            let matches = *pa == oid
+                || repo
+                    .odb
+                    .read(&oid)
+                    .ok()
+                    .filter(|o| o.0 == ObjType::Tag)
+                    .and_then(|o| Tag::parse(&o.1).ok())
+                    .map(|t| t.object == *pa)
+                    .unwrap_or(false);
+            if !matches {
+                continue;
+            }
+        }
+        for (want, needle) in &contains_oids {
+            let anc: std::collections::BTreeSet<Oid> = revwalk::rev_list(&repo, &[oid])?
+                .into_iter()
+                .collect();
+            if anc.contains(needle) != *want {
+                continue 'refs;
+            }
+        }
+        for (want, anc) in &merged_sets {
+            if anc.contains(&oid) != *want {
+                continue 'refs;
+            }
+        }
+        rows.push((name, oid));
+    }
+
+    // sort (multi-key, -atom for desc; keys compare by atom value)
+    if !sort_keys.is_empty() {
+        let eval = |r: &(String, Oid), key: &str| -> String {
+            ref_atom(&repo, &r.0, &r.1, key, &date_mode, &symref_of).unwrap_or_default()
+        };
+        rows.sort_by(|a, b| {
+            for (key, desc) in &sort_keys {
+                let av = eval(a, key);
+                let bv = eval(b, key);
+                let ord = if *desc { bv.cmp(&av) } else { av.cmp(&bv) };
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+            a.0.cmp(&b.0)
+        });
+    }
+
+    let fmt = format.unwrap_or_else(|| "%(objectname) %(objecttype)%09%(refname)".to_string());
+    let head_target = symref_of("HEAD");
+    let mut n = 0usize;
+    for (name, oid) in &rows {
+        if let Some(m) = count {
+            if n >= m {
+                break;
+            }
+        }
+        let line = expand_ref_format(&repo, name, oid, &fmt, &date_mode, &symref_of, &head_target)?;
+        if omit_empty && line.trim().is_empty() {
+            continue;
+        }
+        println!("{}", line);
+        n += 1;
     }
     Ok(0)
+}
+
+fn push_sort_key(keys: &mut Vec<(String, bool)>, k: &str) {
+    let (k, desc) = match k.strip_prefix('-') {
+        Some(rest) => (rest, true),
+        None => (k, false),
+    };
+    keys.push((k.trim_start_matches("%(").trim_end_matches(')').to_string(), desc));
+}
+
+/// Evaluate a single ref atom (without the %(...) wrapper).
+fn ref_atom(
+    repo: &Repo,
+    name: &str,
+    oid: &Oid,
+    atom: &str,
+    date_mode: &str,
+    symref_of: &dyn Fn(&str) -> Option<String>,
+) -> Option<String> {
+    let (atom, mods) = match atom.split_once(':') {
+        Some((a, m)) => (a, m),
+        None => (atom, ""),
+    };
+    let (peeled, atom) = match atom.strip_prefix('*') {
+        Some(rest) => (true, rest),
+        None => (false, atom),
+    };
+    // resolve target: for peeled (*) atoms, deref annotated tag
+    let (mut oid, mut typ) = match repo.odb.read(oid) {
+        Ok(o) => (*oid, o.0),
+        Err(_) => (*oid, ObjType::Commit),
+    };
+    if peeled {
+        if typ != ObjType::Tag {
+            return Some(String::new()); // * atoms are empty on non-tags
+        }
+        if let Ok(o) = repo.odb.read(&oid) {
+            if let Ok(t) = Tag::parse(&o.1) {
+                typ = repo.odb.read(&t.object).map(|x| x.0).unwrap_or(ObjType::Commit);
+                oid = t.object;
+            }
+        }
+    }
+    let commit_like = || -> Option<crate::object::Commit> {
+        match typ {
+            ObjType::Commit => crate::revwalk::load_commit(repo, &oid).ok(),
+            ObjType::Tag => repo
+                .odb
+                .read(&oid)
+                .ok()
+                .and_then(|o| Tag::parse(&o.1).ok())
+                .and_then(|t| {
+                    // for tag objects, creator fields come from the tag itself —
+                    // commit-like atoms read the peeled commit
+                    crate::revwalk::load_commit(repo, &t.object).ok()
+                }),
+            _ => None,
+        }
+    };
+    let ident_fields = |id: &crate::object::Ident, which: &str, mods: &str| -> Option<String> {
+        Some(match which {
+            "name" => {
+                if mods.starts_with("mailmap") || mods.starts_with("trim") {
+                    id.name.clone()
+                } else {
+                    id.name.clone()
+                }
+            }
+            "email" => {
+                // default prints <email>; :trim removes brackets, :localpart
+                if mods.contains("localpart") {
+                    id.email
+                        .split('@')
+                        .next()
+                        .unwrap_or("")
+                        .to_string()
+                } else if mods.contains("trim") {
+                    id.email.clone()
+                } else {
+                    format!("<{}>", id.email)
+                }
+            }
+            "date" => {
+                let m = if mods.is_empty() { date_mode } else { mods };
+                format_date_mode(id.time, &id.tz, m)
+            }
+            _ => return None,
+        })
+    };
+    Some(match atom {
+        "refname" => {
+            if mods.starts_with("short") {
+                shorten_ref(&repo, name)
+            } else if let Some(rest) = mods.strip_prefix("lstrip=") {
+                let n: i64 = rest.parse().unwrap_or(0);
+                let parts: Vec<&str> = name.split('/').collect();
+                if n >= 0 {
+                    parts
+                        .iter()
+                        .skip(n as usize)
+                        .copied()
+                        .collect::<Vec<_>>()
+                        .join("/")
+                } else {
+                    parts
+                        .iter()
+                        .skip(parts.len().saturating_sub((-n) as usize))
+                        .copied()
+                        .collect::<Vec<_>>()
+                        .join("/")
+                }
+            } else if let Some(rest) = mods.strip_prefix("rstrip=") {
+                let n: i64 = rest.parse().unwrap_or(0);
+                let parts: Vec<&str> = name.split('/').collect();
+                if n >= 0 {
+                    parts
+                        .iter()
+                        .take(parts.len().saturating_sub(n as usize))
+                        .copied()
+                        .collect::<Vec<_>>()
+                        .join("/")
+                } else {
+                    parts
+                        .iter()
+                        .take((-n) as usize)
+                        .copied()
+                        .collect::<Vec<_>>()
+                        .join("/")
+                }
+            } else {
+                name.to_string()
+            }
+        }
+        "objecttype" => typ.name().to_string(),
+        "objectname" => {
+            if mods.starts_with("short") {
+                let n: usize = mods
+                    .strip_prefix("short=")
+                    .or_else(|| mods.strip_prefix("short"))
+                    .and_then(|v| if v.is_empty() { None } else { v.parse().ok() })
+                    .unwrap_or(7);
+                oid.short(n.max(4))
+            } else {
+                oid.hex()
+            }
+        }
+        "objectsize" => repo
+            .odb
+            .read(&oid)
+            .map(|o| o.1.len().to_string())
+            .unwrap_or_else(|_| "0".into()),
+        "deltabase" | "HEAD" | "flag" | "worktreepath" | "align" | "end" | "if"
+        | "then" | "else" | "color" | "rest" | "signature" => {
+            if atom == "HEAD" {
+                let t = symref_of("HEAD").unwrap_or_default();
+                if t == name {
+                    "*".to_string()
+                } else {
+                    " ".to_string()
+                }
+            } else {
+                String::new()
+            }
+        }
+        "symref" => symref_of(name).unwrap_or_default(),
+        "upstream" | "push" => {
+            // branch.<name>.remote + .merge
+            let short = shorten_ref(&repo, name);
+            let short = short.strip_prefix("refs/heads/").unwrap_or(&short);
+            let remote = repo
+                .config_get(&format!("branch.{}.remote", short))
+                .unwrap_or_default();
+            let merge = repo
+                .config_get(&format!("branch.{}.merge", short))
+                .unwrap_or_default();
+            let up = if remote == "." {
+                merge
+            } else if !remote.is_empty() && !merge.is_empty() {
+                let bn = merge.strip_prefix("refs/heads/").unwrap_or(&merge);
+                format!("refs/remotes/{}/{}", remote, bn)
+            } else {
+                String::new()
+            };
+            // git only reports upstream when the remote is configured AND
+            // the tracking ref resolves
+            let remote_ok = remote == "."
+                || repo
+                    .config_get(&format!("remote.{}.url", remote))
+                    .map(|v| !v.is_empty())
+                    .unwrap_or(false)
+                || repo
+                    .config_get(&format!("remote.{}.fetch", remote))
+                    .map(|v| !v.is_empty())
+                    .unwrap_or(false);
+            let up = if remote_ok
+                && !up.is_empty()
+                && matches!(repo.resolve_ref(&up), Ok(Some(_)))
+            {
+                up
+            } else {
+                String::new()
+            };
+            if mods.starts_with("short") {
+                shorten_ref(repo, &up)
+            } else {
+                up
+            }
+        }
+        "track" | "trackshort" => String::new(), // ahead/behind — unsupported
+        "subject" => match typ {
+            ObjType::Commit => crate::revwalk::load_commit(repo, &oid)
+                .map(|c| c.summary())
+                .unwrap_or_default(),
+            ObjType::Tag => repo
+                .odb
+                .read(&oid)
+                .ok()
+                .and_then(|o| Tag::parse(&o.1).ok())
+                .map(|t| t.message.lines().next().unwrap_or("").to_string())
+                .unwrap_or_default(),
+            _ => String::new(),
+        },
+        "body" | "contents" => {
+            let msg = match typ {
+                ObjType::Commit => crate::revwalk::load_commit(repo, &oid)
+                    .map(|c| c.message)
+                    .unwrap_or_default(),
+                ObjType::Tag => repo
+                    .odb
+                    .read(&oid)
+                    .ok()
+                    .and_then(|o| Tag::parse(&o.1).ok())
+                    .map(|t| t.message)
+                    .unwrap_or_default(),
+                _ => String::new(),
+            };
+            match atom {
+                "body" => body_of(&msg),
+                _ => match mods {
+                    "subject" => msg.lines().next().unwrap_or("").to_string(),
+                    "body" => body_of(&msg),
+                    _ => msg.trim_end().to_string(),
+                },
+            }
+        }
+        "tag" => repo
+            .odb
+            .read(&oid)
+            .ok()
+            .and_then(|o| if o.0 == ObjType::Tag { Tag::parse(&o.1).ok().map(|t| t.tag) } else { None })
+            .unwrap_or_default(),
+        "type" | "object" | "numparent" | "tree" | "parent" => {
+            match commit_like() {
+                Some(c) => match atom {
+                    "tree" => c.tree.hex(),
+                    "parent" => c
+                        .parents
+                        .iter()
+                        .map(|p| p.hex())
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    "numparent" => c.parents.len().to_string(),
+                    "object" | "type" => {
+                        if typ == ObjType::Tag {
+                            let t = Tag::parse(&repo.odb.read(&oid).ok()?.1).ok()?;
+                            if atom == "object" {
+                                t.object.hex()
+                            } else {
+                                "commit".to_string() // target type approximation
+                            }
+                        } else {
+                            String::new()
+                        }
+                    }
+                    _ => String::new(),
+                },
+                None => String::new(),
+            }
+        }
+        "authorname" | "authoremail" | "authordate" => commit_like()
+            .and_then(|c| ident_fields(&c.author, &atom["author".len()..], mods))
+            .unwrap_or_default(),
+        "committername" | "committeremail" | "committerdate" => commit_like()
+            .and_then(|c| ident_fields(&c.committer, &atom["committer".len()..], mods))
+            .unwrap_or_default(),
+        "taggername" | "taggeremail" | "taggerdate" => {
+            if typ == ObjType::Tag {
+                let field = ident_fields(
+                    &Tag::parse(&repo.odb.read(&oid).ok()?.1)
+                        .ok()
+                        .and_then(|t| t.tagger)
+                        .unwrap_or(crate::object::Ident {
+                            name: String::new(),
+                            email: String::new(),
+                            time: 0,
+                            tz: "+0000".into(),
+                        }),
+                    &atom["tagger".len()..],
+                    mods,
+                )
+                .unwrap_or_default();
+                field
+            } else {
+                String::new()
+            }
+        }
+        "creatordate" | "creator" => match typ {
+            ObjType::Commit => crate::revwalk::load_commit(repo, &oid)
+                .map(|c| {
+                    if atom == "creatordate" {
+                        let m = if mods.is_empty() { date_mode } else { mods };
+                        format_date_mode(c.committer.time, &c.committer.tz, m)
+                    } else {
+                        c.committer.who()
+                    }
+                })
+                .unwrap_or_default(),
+            ObjType::Tag => Tag::parse(&repo.odb.read(&oid).ok()?.1)
+                .ok()
+                .and_then(|t| t.tagger)
+                .map(|id| {
+                    if atom == "creatordate" {
+                        let m = if mods.is_empty() { date_mode } else { mods };
+                        format_date_mode(id.time, &id.tz, m)
+                    } else {
+                        id.who()
+                    }
+                })
+                .unwrap_or_default(),
+            _ => String::new(),
+        },
+        _ => return None,
+    })
+}
+
+fn expand_ref_format(
+    repo: &Repo,
+    name: &str,
+    oid: &Oid,
+    fmt: &str,
+    date_mode: &str,
+    symref_of: &dyn Fn(&str) -> Option<String>,
+    _head_target: &Option<String>,
+) -> Result<String> {
+    let mut out = String::new();
+    let mut it = fmt.chars().peekable();
+    while let Some(c) = it.next() {
+        if c == '%' {
+            if it.peek() == Some(&'%') {
+                it.next();
+                out.push('%');
+                continue;
+            }
+            if it.peek() == Some(&'(') {
+                it.next();
+                let mut atom = String::new();
+                let mut depth = 1;
+                for c2 in it.by_ref() {
+                    if c2 == '(' {
+                        depth += 1;
+                    } else if c2 == ')' {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    atom.push(c2);
+                }
+                if atom == "align" || atom.starts_with("align,") || atom.starts_with("align ") {
+                    // skip to %(end): emit buffered content padded to width
+                    // (collected in the main loop below — handled by the caller
+                    // buffering pattern)
+                    out.push_str("");
+                } else {
+                    match ref_atom(repo, name, oid, &atom, date_mode, symref_of) {
+                        Some(v) => out.push_str(&v),
+                        None => {
+                            return Err(crate::util::GitError::Parse(format!(
+                                "fatal: unknown field name: {}",
+                                atom
+                            )))
+                        }
+                    }
+                }
+                continue;
+            }
+            match it.next() {
+                // %XX hex-byte escape (git's %09 = tab in the default format)
+                Some(d) if d.is_ascii_hexdigit() => {
+                    let mut h = String::new();
+                    h.push(d);
+                    if it.peek().map(|c| c.is_ascii_hexdigit()).unwrap_or(false) {
+                        h.push(it.next().unwrap());
+                    }
+                    match u8::from_str_radix(&h, 16) {
+                        Ok(b) => out.push(b as char),
+                        Err(_) => {
+                            out.push('%');
+                            out.push_str(&h);
+                        }
+                    }
+                }
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('x') => {
+                    let h: String = it.by_ref().take(2).collect();
+                    if let Ok(b) = u8::from_str_radix(&h, 16) {
+                        out.push(b as char);
+                    }
+                }
+                Some(other) => {
+                    out.push('%');
+                    out.push(other);
+                }
+                None => out.push('%'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    Ok(out)
+}
+
+/// fnmatch subset for ref patterns: `*` (any seq), `?`, `[class]`.
+/// Git semantics: patterns without '/' match at any level after the
+/// given prefix; trailing '/*' implied for dir prefixes is handled by caller.
+fn ref_fnmatch(pat: &str, name: &str, icase: bool) -> bool {
+    fn inner(p: &[u8], n: &[u8], icase: bool) -> bool {
+        if p.is_empty() {
+            return n.is_empty();
+        }
+        match p[0] {
+            b'*' => {
+                // "**" or "*" — git refs allow crossing '/'
+                for k in 0..=n.len() {
+                    if inner(&p[1..], &n[k..], icase) {
+                        return true;
+                    }
+                }
+                false
+            }
+            b'?' => !n.is_empty() && n[0] != b'/' && inner(&p[1..], &n[1..], icase),
+            b'[' => {
+                if n.is_empty() {
+                    return false;
+                }
+                let mut i = 1;
+                let neg = p.get(i) == Some(&b'!') || p.get(i) == Some(&b'^');
+                if neg {
+                    i += 1;
+                }
+                let mut matched = false;
+                let mut first = true;
+                while i < p.len() && (p[i] != b']' || first) {
+                    first = false;
+                    if i + 2 < p.len() && p[i + 1] == b'-' && p[i + 2] != b']' {
+                        let (lo, hi) = (p[i].to_ascii_lowercase(), p[i + 2].to_ascii_lowercase());
+                        let c = if icase {
+                            n[0].to_ascii_lowercase()
+                        } else {
+                            n[0]
+                        };
+                        if c >= lo && c <= hi {
+                            matched = true;
+                        }
+                        i += 3;
+                    } else {
+                        let pc = if icase { p[i].to_ascii_lowercase() } else { p[i] };
+                        let nc = if icase { n[0].to_ascii_lowercase() } else { n[0] };
+                        if pc == nc {
+                            matched = true;
+                        }
+                        i += 1;
+                    }
+                }
+                if i >= p.len() {
+                    return false; // unterminated class
+                }
+                (matched != neg) && inner(&p[i + 1..], &n[1..], icase)
+            }
+            b'\\' if p.len() > 1 => {
+                !n.is_empty() && p[1] == n[0] && inner(&p[2..], &n[1..], icase)
+            }
+            c => {
+                if n.is_empty() {
+                    return false;
+                }
+                let (pc, nc) = if icase {
+                    (c.to_ascii_lowercase(), n[0].to_ascii_lowercase())
+                } else {
+                    (c, n[0])
+                };
+                pc == nc && inner(&p[1..], &n[1..], icase)
+            }
+        }
+    }
+    inner(pat.as_bytes(), name.as_bytes(), icase)
 }
 
 fn cmd_show_ref(args: &[String]) -> Result<i32> {
